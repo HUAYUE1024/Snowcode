@@ -81,10 +81,11 @@ def ingest(
     with console.status("[bold green]Initializing embedding model...", spinner="dots"):
         store = VectorStore(root, embedding_model=emb_model)
 
-    if reset:
-        with console.status("[bold yellow]Resetting index...", spinner="dots"):
-            store.reset()
-        console.print("[yellow]Index reset.[/]")
+    existing_count = store.count()
+    if reset or existing_count > 0:
+        if existing_count > 0 and not reset:
+            console.print(f"  [dim]Replacing existing index ({existing_count} chunks)...[/]")
+        store.reset()
 
     # Scan files
     with console.status("[bold green]Scanning project files...", spinner="dots"):

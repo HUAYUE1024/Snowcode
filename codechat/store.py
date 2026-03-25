@@ -48,15 +48,20 @@ class VectorStore:
         import os
         import warnings
 
+        # Save original env vars to restore after loading
+        _saved_env = {}
+        _ssl_vars = ("HF_HUB_DISABLE_SSL_VERIFICATION", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
+        for k in _ssl_vars:
+            _saved_env[k] = os.environ.get(k)
+
         # HuggingFace mirror for China users
         if "HF_ENDPOINT" not in os.environ:
             os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-        os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFICATION", "1")
-        os.environ.setdefault("CURL_CA_BUNDLE", "")
-        os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
+        # Temporarily disable SSL only for HuggingFace model download
+        os.environ["HF_HUB_DISABLE_SSL_VERIFICATION"] = "1"
         warnings.filterwarnings("ignore", message=".*UNEXPECTED.*")
 
-        # Wrap stderr to filter out LOAD REPORT noise while keeping progress bars
+        # Filter stderr: keep progress bars, suppress LOAD REPORT noise
         _orig_stderr = sys.stderr
         _filter_keys = ("LOAD REPORT", "UNEXPECTED", "Notes:", "embeddings.position", "--------+")
 
@@ -74,6 +79,13 @@ class VectorStore:
             self._model = SentenceTransformer(self._model_name)
         finally:
             sys.stderr = _orig_stderr
+            # Restore original SSL env vars
+            for k in _ssl_vars:
+                if _saved_env[k] is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = _saved_env[k]
+
         return self._model
 
     def _embed(self, texts: list[str]) -> np.ndarray:

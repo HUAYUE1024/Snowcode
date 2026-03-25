@@ -7,6 +7,10 @@ from dataclasses import dataclass
 
 from .config import DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_OVERLAP
 
+# Minimum lines per chunk — avoid 2-3 line fragments
+MIN_CHUNK_LINES = 10
+MIN_CHUNK_CHARS = 200
+
 
 @dataclass
 class Chunk:
@@ -28,21 +32,18 @@ def _split_by_lines(text: str, chunk_size: int, overlap: int) -> list[tuple[str,
     start = 0
 
     while start < len(lines):
-        # Approximate chunk by character count
         end = start
         char_count = 0
         while end < len(lines) and char_count < chunk_size:
             char_count += len(lines[end]) + 1
             end += 1
-
         if end <= start:
             end = start + 1
 
         content = "\n".join(lines[start:end])
         if content.strip():
-            chunks.append((content, start + 1, end))  # 1-indexed lines
+            chunks.append((content, start + 1, end))
 
-        # Move forward with overlap
         next_start = end - overlap
         if next_start <= start:
             next_start = start + 1
@@ -51,41 +52,124 @@ def _split_by_lines(text: str, chunk_size: int, overlap: int) -> list[tuple[str,
     return chunks
 
 
+# Strict patterns: only match actual top-level definitions
+_FN_PATTERNS = [
+    # Python
+    re.compile(r"^def \w+\s*\("),
+    re.compile(r"^async def \w+\s*\("),
+    re.compile(r"^class \w+"),
+    # JavaScript / TypeScript
+    re.compile(r"^export\s+(default\s+)?(function|class|const|let|var)\s+\w+"),
+    re.compile(r"^function\s+\w+\s*\("),
+    re.compile(r"^(const|let|var)\s+\w+\s*=\s*(async\s+)?\(.*\)\s*=>"),
+    re.compile(r"^(const|let|var)\s+\w+\s*=\s*function\s*\("),
+    # Go
+    re.compile(r"^func\s+(\(\w+\s+\*\w+\)\s+)?\w+\s*\("),
+    # Rust
+    re.compile(r"^(pub\s+)?(async\s+)?fn\s+\w+"),
+    re.compile(r"^impl\b"),
+    re.compile(r"^pub\s+(struct|enum|trait|impl)\b"),
+    # Java / Kotlin / C#
+    re.compile(r"^(public|private|protected|internal)\s+(static\s+)?(async\s+)?[\w<>\[\]]+\s+\w+\s*\("),
+    re.compile(r"^fun\s+\w+\s*\("),
+    # C / C++
+    re.compile(r"^[\w\s\*]+\w+\s*\([^)]*\)\s*\{"),
+    re.compile(r"^class\s+\w+"),
+    # Ruby
+    re.compile(r"^def\s+\w+"),
+    re.compile(r"^class\s+\w+"),
+    re.compile(r"^module\s+\w+"),
+    # PHP
+    re.compile(r"^(public|private|protected)?\s*function\s+\w+\s*\("),
+    # Shell
+    re.compile(r"^\w+\s*\(\)\s*\{"),
+]
+
+
+def _is_fn_def(line: str) -> bool:
+    """Check if a line is a top-level function/class definition."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    for pat in _FN_PATTERNS:
+        if pat.match(stripped):
+            return True
+    return False
+
+
+def _merge_small_chunks(
+    raw_chunks: list[tuple[str, int, int]],
+    min_lines: int = MIN_CHUNK_LINES,
+    min_chars: int = MIN_CHUNK_CHARS,
+) -> list[tuple[str, int, int]]:
+    """Merge tiny chunks with their neighbors."""
+    if not raw_chunks:
+        return []
+
+    merged: list[tuple[str, int, int]] = []
+    buf_content = ""
+    buf_start = 0
+    buf_end = 0
+
+    for content, start, end in raw_chunks:
+        if not buf_content:
+            buf_content = content
+            buf_start = start
+            buf_end = end
+            continue
+
+        lines_in_buf = buf_end - buf_start + 1
+        if lines_in_buf < min_lines or len(buf_content) < min_chars:
+            # Too small, merge with next
+            buf_content += "\n" + content
+            buf_end = end
+        else:
+            merged.append((buf_content, buf_start, buf_end))
+            buf_content = content
+            buf_start = start
+            buf_end = end
+
+    if buf_content:
+        # Last chunk: merge backward if too small
+        lines_in_buf = buf_end - buf_start + 1
+        if (lines_in_buf < min_lines or len(buf_content) < min_chars) and merged:
+            prev_content, prev_start, _ = merged[-1]
+            merged[-1] = (prev_content + "\n" + buf_content, prev_start, buf_end)
+        else:
+            merged.append((buf_content, buf_start, buf_end))
+
+    return merged
+
+
 def _split_by_functions(text: str) -> list[tuple[str, int, int]]:
     """
-    Attempt to split code by function/class definitions.
-    Falls back to line-based splitting for individual functions.
+    Split code by function/class definitions.
+    Only splits at real definitions, merges tiny fragments.
     """
     lines = text.splitlines()
-    if len(lines) < 3:
+    if len(lines) < MIN_CHUNK_LINES:
         return [(text, 1, len(lines))]
-
-    # Patterns for common function/class definitions
-    fn_pattern = re.compile(
-        r"^(def |class |func |fn |function |pub fn |async def |export (function|class|default) "
-        r"|public |private |protected |void |int |string |bool )",
-        re.MULTILINE,
-    )
 
     boundaries: list[int] = [0]
     for i, line in enumerate(lines):
-        if fn_pattern.match(line.strip()):
-            # Only add if there's meaningful content before this boundary
-            if i > 0 and any(l.strip() for l in lines[boundaries[-1]:i]):
+        if _is_fn_def(line):
+            # Don't split at line 0-1 (would create empty prefix)
+            if i > 2:
                 boundaries.append(i)
 
     if len(boundaries) <= 1:
         return [(text, 1, len(lines))]
 
-    chunks: list[tuple[str, int, int]] = []
+    raw_chunks: list[tuple[str, int, int]] = []
     for i in range(len(boundaries)):
         start = boundaries[i]
         end = boundaries[i + 1] if i + 1 < len(boundaries) else len(lines)
         content = "\n".join(lines[start:end])
         if content.strip():
-            chunks.append((content, start + 1, end))
+            raw_chunks.append((content, start + 1, end))
 
-    return chunks
+    # Merge tiny fragments
+    return _merge_small_chunks(raw_chunks)
 
 
 def chunk_file(
@@ -110,10 +194,23 @@ def chunk_file(
             )]
         return []
 
-    # Try function-level splitting first, then fall back to line-based
-    fn_chunks = _split_by_functions(content)
+    # For medium files, try function-level splitting
+    if len(content) <= chunk_size * 3:
+        fn_chunks = _split_by_functions(content)
+        final: list[Chunk] = []
+        for sub_content, start_line, end_line in fn_chunks:
+            if sub_content.strip():
+                final.append(Chunk(
+                    content=sub_content,
+                    file_path=file_path,
+                    start_line=start_line,
+                    end_line=end_line,
+                    chunk_index=len(final),
+                ))
+        return final
 
-    # If function splitting produced large chunks, further split them
+    # For large files: function splitting, then line-based for oversized chunks
+    fn_chunks = _split_by_functions(content)
     final_chunks: list[Chunk] = []
     for sub_content, start_line, end_line in fn_chunks:
         if len(sub_content) <= chunk_size * 1.5:
@@ -126,7 +223,6 @@ def chunk_file(
                     chunk_index=len(final_chunks),
                 ))
         else:
-            sub_lines = sub_content.splitlines()
             for sub_s, sub_ss, sub_es in _split_by_lines(sub_content, chunk_size, overlap):
                 if sub_s.strip():
                     final_chunks.append(Chunk(

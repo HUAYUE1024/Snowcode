@@ -36,11 +36,11 @@ SKIP_DIRS = {
 MAX_FILE_SIZE = 1_000_000  # 1MB
 
 # Default chunk settings
-DEFAULT_CHUNK_SIZE = 1000
+DEFAULT_CHUNK_SIZE = 1500
 DEFAULT_CHUNK_OVERLAP = 200
 
-# Embedding model
-DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+# Embedding model — all-mpnet-base-v2 for better code retrieval quality
+DEFAULT_EMBEDDING_MODEL = "all-mpnet-base-v2"
 
 # Config dir inside project
 CODECHAT_DIR = ".codechat"

@@ -1,6 +1,7 @@
 """File scanning - discover and read code files from a project."""
 
 import fnmatch
+import os
 from pathlib import Path
 
 import pathspec
@@ -15,7 +16,7 @@ def _load_gitignore(project_root: Path) -> pathspec.PathSpec | None:
     gitignore = project_root / ".gitignore"
     if gitignore.exists():
         lines = gitignore.read_text(encoding="utf-8", errors="ignore").splitlines()
-        return pathspec.PathSpec.from_lines("gitwildmatch", lines)
+        return pathspec.PathSpec.from_lines("wildmatch", lines)
     return None
 
 
@@ -33,6 +34,7 @@ def scan_files(project_root: Path, extra_extensions: set[str] | None = None) -> 
     """
     Scan a project directory and return all code/doc files.
 
+    Uses os.walk with directory pruning for efficient traversal.
     Respects .gitignore, skips binary/build directories.
     """
     project_root = project_root.resolve()
@@ -41,38 +43,36 @@ def scan_files(project_root: Path, extra_extensions: set[str] | None = None) -> 
 
     files: list[Path] = []
 
-    for path in project_root.rglob("*"):
-        if not path.is_file():
-            continue
+    for dirpath, dirnames, filenames in os.walk(str(project_root)):
+        # Prune directories in-place (os.walk supports this)
+        dirnames[:] = [
+            d for d in dirnames
+            if not _should_skip_dir(d) and d != ".codechat"
+        ]
 
-        rel = path.relative_to(project_root)
+        rel_dir = Path(dirpath).relative_to(project_root)
 
-        # Skip directories in path
-        if any(_should_skip_dir(part) for part in rel.parts):
-            continue
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            rel = rel_dir / fname
 
-        # Skip .codechat dir
-        if ".codechat" in rel.parts:
-            continue
-
-        # Check gitignore
-        if gitignore and gitignore.match_file(str(rel)):
-            continue
-
-        # Check extension
-        if path.suffix.lower() not in extensions:
-            continue
-
-        # Check file size
-        try:
-            if path.stat().st_size > MAX_FILE_SIZE:
+            # Check gitignore
+            if gitignore and gitignore.match_file(str(rel)):
                 continue
-            if path.stat().st_size == 0:
-                continue
-        except OSError:
-            continue
 
-        files.append(path)
+            # Check extension
+            if fpath.suffix.lower() not in extensions:
+                continue
+
+            # Check file size
+            try:
+                size = fpath.stat().st_size
+                if size == 0 or size > MAX_FILE_SIZE:
+                    continue
+            except OSError:
+                continue
+
+            files.append(fpath)
 
     return sorted(files)
 

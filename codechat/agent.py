@@ -81,7 +81,10 @@ class Tool:
 
     name: str = ""
     description: str = ""
-    parameters: dict[str, str] = {}
+
+    @property
+    def parameters(self) -> dict[str, str]:
+        return {}
 
     def run(self, params: dict, ctx: dict) -> str:
         raise NotImplementedError
@@ -90,7 +93,10 @@ class Tool:
 class SearchTool(Tool):
     name = "search"
     description = "语义搜索代码库，返回最相关的代码片段"
-    parameters = {"query": "搜索关键词", "n": "结果数量(默认5)"}
+
+    @property
+    def parameters(self):
+        return {"query": "搜索关键词", "n": "结果数量(默认5)"}
 
     def run(self, params: dict, ctx: dict) -> str:
         store: VectorStore = ctx["store"]
@@ -111,7 +117,10 @@ class SearchTool(Tool):
 class ReadFileTool(Tool):
     name = "read_file"
     description = "读取文件内容（可指定行范围）"
-    parameters = {"path": "文件路径", "start": "起始行(可选)", "end": "结束行(可选)"}
+
+    @property
+    def parameters(self):
+        return {"path": "文件路径", "start": "起始行(可选)", "end": "结束行(可选)"}
 
     def run(self, params: dict, ctx: dict) -> str:
         root: Path = ctx["root"]
@@ -141,7 +150,10 @@ class ReadFileTool(Tool):
 class FindPatternTool(Tool):
     name = "find_pattern"
     description = "正则搜索代码（找函数定义、import等）"
-    parameters = {"pattern": "正则表达式", "file_glob": "文件过滤(可选)"}
+
+    @property
+    def parameters(self):
+        return {"pattern": "正则表达式", "file_glob": "文件过滤(可选)"}
 
     def run(self, params: dict, ctx: dict) -> str:
         root: Path = ctx["root"]
@@ -172,7 +184,10 @@ class FindPatternTool(Tool):
 class ListDirTool(Tool):
     name = "list_dir"
     description = "列出目录结构"
-    parameters = {"path": "目录路径(留空=根目录)", "depth": "深度(默认2)"}
+
+    @property
+    def parameters(self):
+        return {"path": "目录路径(留空=根目录)", "depth": "深度(默认2)"}
 
     def run(self, params: dict, ctx: dict) -> str:
         root: Path = ctx["root"]
@@ -210,7 +225,10 @@ class ListDirTool(Tool):
 class ReadMultipleTool(Tool):
     name = "read_multiple"
     description = "同时读取多个文件的关键行"
-    parameters = {"files": "格式: 'a.py:10-30,b.py:5-15'"}
+
+    @property
+    def parameters(self):
+        return {"files": "格式: 'a.py:10-30,b.py:5-15'"}
 
     def run(self, params: dict, ctx: dict) -> str:
         root: Path = ctx["root"]
