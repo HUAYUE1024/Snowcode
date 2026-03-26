@@ -58,16 +58,16 @@ def _load_hf_model(model_name: str, model_class, use_hf_mirror: bool = True):
         _ssl_vars = (
             "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "HF_ENDPOINT", 
             "HF_HUB_DISABLE_SYMLINKS_WARNING", "HF_HUB_DISABLE_PROGRESS_BARS",
-            "HF_HUB_DISABLE_IMPLICIT_TOKEN", "HF_HUB_DISABLE_SSL_VERIFICATION"
+            "HF_HUB_DISABLE_IMPLICIT_TOKEN", "HF_HUB_DISABLE_SSL_VERIFICATION",
+            "HF_HUB_OFFLINE"
         )
         for k in _ssl_vars:
             _saved_env[k] = os.environ.get(k)
     
-        # HuggingFace mirror for China users (Default to ON for better connectivity)
-        if use_hf_mirror and "HF_ENDPOINT" not in os.environ:
-            # Always use HF mirror by default unless explicitly disabled
-            if os.environ.get("USE_HF_MIRROR", "true").lower() in ("true", "1", "yes"):
-                os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+        # HuggingFace mirror for China users
+        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+        # Force offline if model already cached (avoids hanging on network check)
+        os.environ["HF_HUB_OFFLINE"] = "1"
                 
         # Suppress symlinks warning on Windows
         os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
