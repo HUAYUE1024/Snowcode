@@ -296,9 +296,9 @@ Repeat detection auto-exits after 2 identical tool calls. Hard cap at 50 steps.
 - [x] AST-aware chunking (Tree-sitter, 20+ languages)
 - [x] BM25 hybrid search + cross-encoder reranking
 - [x] Test suite
-- [ ] Multi-turn conversation memory
-- [ ] `.codechatignore` custom rules
-- [ ] Export Q&A to Markdown
+- [x] Multi-turn conversation memory (chat mode, persisted to chat_history.json)
+- [x] `.codechatignore` custom rules (merged with .gitignore)
+- [x] Export Q&A to Markdown (`/export file.md` in chat mode)
 
 ## License
 
