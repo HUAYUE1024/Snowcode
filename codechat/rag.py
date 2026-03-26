@@ -288,7 +288,7 @@ def answer_question(
         }
 
     context = _format_context(results)
-    prompt = _build_prompt(context, question)
+    prompt = _build_prompt(context, question, history=history)
     answer = _call_llm(prompt, model=model, history=history)
 
     if not answer:
@@ -324,7 +324,7 @@ def answer_question_stream(
         return {"answer": msg, "sources": [], "context": ""}
 
     context = _format_context(results)
-    prompt = _build_prompt(context, question)
+    prompt = _build_prompt(context, question, history=history)
     answer = stream_llm(prompt, model=model, on_think=on_think, on_answer=on_answer, history=history)
 
     if not answer:
@@ -340,7 +340,10 @@ def answer_question_stream(
     return {"answer": answer, "sources": results, "context": context}
 
 
-def _build_prompt(context: str, question: str) -> str:
+def _build_prompt(context: str, question: str, history: list[dict] | None = None) -> str:
+    # If history is present, we might want to adjust the prompt to be more conversational
+    # but currently history is handled by messages list in _call_llm/stream_llm.
+    # This function creates the *last* user message content.
     return f"""## 代码上下文
 
 以下是与用户问题相关的代码片段，每个片段标注了文件路径和行号：

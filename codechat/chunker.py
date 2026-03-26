@@ -133,8 +133,8 @@ def _merge_small_chunks(
         # Last chunk: merge backward if too small
         lines_in_buf = buf_end - buf_start + 1
         if (lines_in_buf < min_lines or len(buf_content) < min_chars) and merged:
-            prev_content, prev_start, _ = merged[-1]
-            merged[-1] = (prev_content + "\n" + buf_content, prev_start, buf_end)
+            prev_content, prev_start, prev_end = merged.pop()
+            merged.append((prev_content + "\n" + buf_content, prev_start, buf_end))
         else:
             merged.append((buf_content, buf_start, buf_end))
 
@@ -202,18 +202,18 @@ def chunk_file(
         from .ast_chunker import ast_split_definitions
         ast_chunks = ast_split_definitions(file_path, content, chunk_size)
         if ast_chunks and len(ast_chunks) > 1:
-            final: list[Chunk] = []
+            ast_final: list[Chunk] = []
             for sub_content, start_line, end_line in ast_chunks:
                 if sub_content.strip():
-                    final.append(Chunk(
+                    ast_final.append(Chunk(
                         content=sub_content,
                         file_path=file_path,
                         start_line=start_line,
                         end_line=end_line,
-                        chunk_index=len(final),
+                        chunk_index=len(ast_final),
                     ))
-            if final:
-                return final
+            if ast_final:
+                return ast_final
     except Exception:
         pass
 
@@ -222,17 +222,17 @@ def chunk_file(
 
     # For medium files, return function chunks directly
     if len(content) <= chunk_size * 3:
-        final: list[Chunk] = []
+        fn_final: list[Chunk] = []
         for sub_content, start_line, end_line in fn_chunks:
             if sub_content.strip():
-                final.append(Chunk(
+                fn_final.append(Chunk(
                     content=sub_content,
                     file_path=file_path,
                     start_line=start_line,
                     end_line=end_line,
-                    chunk_index=len(final),
+                    chunk_index=len(fn_final),
                 ))
-        return final
+        return fn_final
 
     # For large files: function splitting, then line-based for oversized chunks
     final_chunks: list[Chunk] = []

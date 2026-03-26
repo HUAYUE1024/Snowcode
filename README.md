@@ -23,6 +23,7 @@ When you take over a complex open-source project or revisit your own codebase fr
 # Install
 git clone https://github.com/HUAYUE1024/codechat.git
 cd codechat
+pip install -r requirements.txt
 pip install -e .
 
 # Use
@@ -30,6 +31,7 @@ cd /path/to/your-project
 codechat ingest                              # build vector index
 codechat ask "how does auth work?"           # ask questions
 codechat agent "trace the request lifecycle" # multi-step exploration
+codechat tree --deps                         # visualize dependencies
 codechat chat                                # interactive REPL
 ```
 
@@ -41,6 +43,9 @@ codechat chat                                # interactive REPL
 | `ask "question"` | Ask about the codebase (streaming output) |
 | `agent "question"` | Multi-step agent: Plan → Tools → Memory → Answer |
 | `chat` | Interactive REPL with history and auto-complete |
+| `tree` | Generate visual project structure with symbols |
+| `tree --deps` | Generate visual project structure and file dependency graph |
+| `tree --mermaid` | Generate a Mermaid.js directed dependency graph |
 | `explain "target"` | Explain a function, class, or file |
 | `review` | Code review: bugs, security, performance |
 | `find "pattern"` | Search code patterns (regex, definitions, imports) |
@@ -266,6 +271,8 @@ your-project/
 │   ├── config.json      # Index config
 │   ├── embeddings.npy   # Vector matrix
 │   ├── metadata.json    # File paths + line numbers
+│   ├── bm25.json        # BM25 keyword frequencies
+│   ├── history.json     # Chat history memory
 │   └── memory.jsonl     # Agent long-term memory
 ```
 
@@ -281,6 +288,8 @@ your-project/
 | `pathspec` | .gitignore parsing |
 | `openai` | OpenAI-compatible API |
 | `httpx` | Ollama API |
+| `tree-sitter` | AST Parsing |
+| `tree-sitter-languages` | Language grammars for AST |
 
 ## Supported File Types
 
@@ -331,6 +340,8 @@ Yes. `codechat ingest --reset` to rebuild.
 - [x] Test suite
 - [x] Hybrid Search (Vector + BM25)
 - [x] Streaming Markdown rendering (Rich Live)
+- [x] Project Structure Tree with AST symbols
+- [x] Dependency Graph Rendering (Tree & Mermaid.js)
 
 ## License
 

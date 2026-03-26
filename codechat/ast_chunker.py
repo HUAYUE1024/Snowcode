@@ -289,8 +289,8 @@ def _merge_tiny(
     if buf_text:
         buf_lines = buf_end - buf_start + 1
         if buf_lines < min_lines and merged:
-            prev_text, prev_start, _ = merged[-1]
-            merged[-1] = (prev_text + "\n" + buf_text, prev_start, buf_end)
+            prev_text, prev_start, prev_end = merged.pop()
+            merged.append((prev_text + "\n" + buf_text, prev_start, buf_end))
         else:
             merged.append((buf_text, buf_start, buf_end))
 

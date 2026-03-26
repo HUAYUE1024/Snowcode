@@ -134,7 +134,7 @@ def ingest(
                        f"[yellow]{len(files_to_process)}[/] changed/new, "
                        f"[red]{len(deleted_rels)}[/] deleted")
         if not files_to_process and not deleted_rels:
-            console.print(f"  [green]Index is up to date.[/]")
+            console.print("  [green]Index is up to date.[/]")
             # Still save hashes in case format changed
             store.save_hashes(new_hashes)
             save_config(root, {
@@ -702,6 +702,41 @@ def agent(question: tuple[str, ...], path: str | None, model: str | None, steps:
     # Show execution summary
     if result.actions:
         console.print(f"  [dim]Actions: {result.steps_taken} steps | Memory: {result.memory_entries} entries[/]")
+    console.print()
+
+
+@cli.command()
+@click.option("--path", "-p", default=None, help="Project root path (default: auto-detect)")
+@click.option("--symbols", "-s", is_flag=True, help="Show classes and functions in the tree")
+@click.option("--deps", "-d", is_flag=True, help="Show dependency graph (imports) for the project")
+@click.option("--internal", "-i", is_flag=True, help="Only show internal dependencies")
+@click.option("--mermaid", "-m", is_flag=True, help="Output dependency graph in Mermaid format")
+def tree(path: str | None, symbols: bool, deps: bool, internal: bool, mermaid: bool):
+    """Generate a visual project structure and dependency tree."""
+    from .tree_gen import build_project_tree, build_dependency_graph, generate_mermaid_graph
+    
+    root = Path(path).resolve() if path else _find_project_root()
+    
+    if mermaid:
+        with console.status("[bold green]Generating Mermaid graph...", spinner="dots"):
+            mermaid_output = generate_mermaid_graph(root, internal_only=internal)
+        console.print()
+        console.print(Syntax(mermaid_output, "markdown", theme="monokai", word_wrap=True))
+        console.print("\n[dim]Tip: You can copy this output and paste it into any Markdown file to render the graph.[/]")
+        return
+
+    with console.status("[bold green]Analyzing project structure...", spinner="dots"):
+        project_tree = build_project_tree(root, show_symbols=symbols)
+        if deps:
+            dep_tree = build_dependency_graph(root, internal_only=internal)
+        else:
+            dep_tree = None
+        
+    console.print()
+    console.print(project_tree)
+    if dep_tree:
+        console.print()
+        console.print(dep_tree)
     console.print()
 
 
