@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 # ── HuggingFace env vars MUST be set before any HF import ──
-import os as _os
-_os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-_os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFICATION", "1")
-_os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-_os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-_os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+import os
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFICATION", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
 
 import math
 import re
