@@ -89,8 +89,22 @@ def _load_hf_model(model_name: str, model_class, use_hf_mirror: bool = True):
         warnings.filterwarnings("ignore", message=".*UNEXPECTED.*")
         warnings.filterwarnings("ignore", message=".*unauthenticated requests.*")
         
-        with _suppress_stderr():
+        # OS-level stderr redirect to catch C extension output
+        import tempfile as _tempfile
+        _orig_fd = os.dup(2)
+        _tmp = _tempfile.TemporaryFile()
+        os.dup2(_tmp.fileno(), 2)
+        try:
             model = model_class(model_name)
+        finally:
+            os.dup2(_orig_fd, 2)
+            os.close(_orig_fd)
+            # Dump non-noise lines from temp file
+            _tmp.seek(0)
+            for _line in _tmp:
+                if not any(k in _line for k in (b"LOAD REPORT", b"UNEXPECTED", b"Notes:", b"embeddings.position", b"bert.embeddings.position", b"--------+")):
+                    os.write(2, _line)
+            _tmp.close()
     
         # Restore original SSL env vars
         for k in _ssl_vars:
