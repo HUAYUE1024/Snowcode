@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import json
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -115,52 +116,60 @@ def _get_llm_config(model: str | None = None) -> tuple[str, str, str, bool]:
     return "", "", "", False
 
 
-def _call_llm(prompt: str, model: str | None = None, _system_override: str | None = None, history: list[dict] | None = None) -> str:
+def _call_llm(prompt: str, model: str | None = None, _system_override: str | None = None, history: list[dict] | None = None, max_retries: int = 3) -> str:
     """Non-streaming LLM call (used as fallback)."""
     api_key, base_url, llm_model, thinking = _get_llm_config(model)
     system_msg = _system_override or SYSTEM_PROMPT
     messages = [{"role": "system", "content": system_msg}]
     if history:
-        # 仅保留最近的 10 条消息（5轮对话）以避免上下文超限
-        messages.extend(history[-10:])
+        # Use configurable history limit, fallback to 10
+        limit = int(os.environ.get("CODECHAT_HISTORY_LIMIT", "10"))
+        messages.extend(history[-limit:])
     messages.append({"role": "user", "content": prompt})
 
     if not api_key:
         return ""
 
-    # Ollama uses httpx, not openai SDK
-    if api_key == "ollama":
-        try:
-            import httpx
-            resp = httpx.post(
-                f"{base_url}/api/chat",
-                json={
-                    "model": llm_model,
-                    "messages": messages,
-                    "stream": False,
-                },
-                timeout=120,
-            )
-            if resp.status_code == 200:
-                return resp.json()["message"]["content"]
-        except Exception as e:
-            print(f"\n[LLM Error] {type(e).__name__}: {e}", file=sys.stderr)
-        return ""
+    for attempt in range(max_retries):
+        # Ollama uses httpx, not openai SDK
+        if api_key == "ollama":
+            try:
+                import httpx
+                resp = httpx.post(
+                    f"{base_url}/api/chat",
+                    json={
+                        "model": llm_model,
+                        "messages": messages,
+                        "stream": False,
+                    },
+                    timeout=120,
+                )
+                if resp.status_code == 200:
+                    return resp.json()["message"]["content"]
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                print(f"\n[LLM Error] {type(e).__name__}: {e}", file=sys.stderr)
+            return ""
 
-    # OpenAI-compatible API
-    try:
-        import openai
-        client = openai.OpenAI(api_key=api_key, base_url=base_url)
-        resp = client.chat.completions.create(
-            model=llm_model,
-            messages=messages,
-            temperature=0.1,
-            max_tokens=4096,
-            extra_body={"enable_thinking": thinking} if thinking else {},
-        )
-        return resp.choices[0].message.content or ""
-    except Exception as e:
-        print(f"\n[LLM Error] {type(e).__name__}: {e}", file=sys.stderr)
+        # OpenAI-compatible API
+        try:
+            import openai
+            client = openai.OpenAI(api_key=api_key, base_url=base_url)
+            resp = client.chat.completions.create(
+                model=llm_model,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=4096,
+                extra_body={"enable_thinking": thinking} if thinking else {},
+            )
+            return resp.choices[0].message.content or ""
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            print(f"\n[LLM Error] {type(e).__name__}: {e}", file=sys.stderr)
 
     return ""
 
@@ -171,6 +180,7 @@ def stream_llm(
     on_think: Callable[[str], None] | None = None,
     on_answer: Callable[[str], None] | None = None,
     history: list[dict] | None = None,
+    max_retries: int = 3,
 ) -> str:
     """
     Streaming LLM call with thinking/reasoning support.
@@ -182,8 +192,9 @@ def stream_llm(
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
-        # 仅保留最近的 10 条消息（5轮对话）以避免上下文超限
-        messages.extend(history[-10:])
+        # Use configurable history limit, fallback to 10
+        limit = int(os.environ.get("CODECHAT_HISTORY_LIMIT", "10"))
+        messages.extend(history[-limit:])
     messages.append({"role": "user", "content": prompt})
 
     if not api_key:
@@ -193,68 +204,77 @@ def stream_llm(
             on_answer(answer)
         return answer
 
-    # Ollama: use httpx streaming
-    if api_key == "ollama":
+    for attempt in range(max_retries):
+        # Ollama: use httpx streaming
+        if api_key == "ollama":
+            try:
+                import httpx
+                answer_parts: list[str] = []
+                with httpx.stream(
+                    "POST",
+                    f"{base_url}/api/chat",
+                    json={
+                        "model": llm_model,
+                        "messages": messages,
+                        "stream": True,
+                    },
+                    timeout=120,
+                ) as resp:
+                    for line in resp.iter_lines():
+                        if line:
+                            try:
+                                data = json.loads(line)
+                                content = data.get("message", {}).get("content", "")
+                                if content:
+                                    answer_parts.append(content)
+                                    if on_answer:
+                                        on_answer(content)
+                            except json.JSONDecodeError:
+                                continue
+                return "".join(answer_parts)
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                print(f"\n[LLM Error] {type(e).__name__}: {e}", file=sys.stderr)
+                return ""
+
+        # OpenAI-compatible streaming
         try:
-            import httpx
+            import openai
+            client = openai.OpenAI(api_key=api_key, base_url=base_url)
+            stream = client.chat.completions.create(
+                model=llm_model,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=4096,
+                stream=True,
+                extra_body={"enable_thinking": thinking} if thinking else {},
+            )
             answer_parts: list[str] = []
-            with httpx.stream(
-                "POST",
-                f"{base_url}/api/chat",
-                json={
-                    "model": llm_model,
-                    "messages": messages,
-                    "stream": True,
-                },
-                timeout=120,
-            ) as resp:
-                for line in resp.iter_lines():
-                    if line:
-                        try:
-                            data = json.loads(line)
-                            content = data.get("message", {}).get("content", "")
-                            if content:
-                                answer_parts.append(content)
-                                if on_answer:
-                                    on_answer(content)
-                        except json.JSONDecodeError:
-                            continue
+            is_answering = False
+            for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta is None:
+                    continue
+                # Reasoning / thinking tokens
+                if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                    if on_think:
+                        on_think(delta.reasoning_content)
+                # Answer tokens
+                if delta.content:
+                    if not is_answering:
+                        is_answering = True
+                    answer_parts.append(delta.content)
+                    if on_answer:
+                        on_answer(delta.content)
             return "".join(answer_parts)
         except Exception as e:
-            print(f"\n[LLM Error] {type(e).__name__}: {e}", file=sys.stderr)
-
-    # OpenAI-compatible streaming
-    try:
-        import openai
-        client = openai.OpenAI(api_key=api_key, base_url=base_url)
-        stream = client.chat.completions.create(
-            model=llm_model,
-            messages=messages,
-            temperature=0.1,
-            max_tokens=4096,
-            stream=True,
-            extra_body={"enable_thinking": thinking} if thinking else {},
-        )
-        answer_parts: list[str] = []
-        is_answering = False
-        for chunk in stream:
-            delta = chunk.choices[0].delta if chunk.choices else None
-            if delta is None:
+            if not locals().get("is_answering", False) and attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
                 continue
-            # Reasoning / thinking tokens
-            if hasattr(delta, "reasoning_content") and delta.reasoning_content:
-                if on_think:
-                    on_think(delta.reasoning_content)
-            # Answer tokens
-            if delta.content:
-                if not is_answering:
-                    is_answering = True
-                answer_parts.append(delta.content)
-                if on_answer:
-                    on_answer(delta.content)
-        return "".join(answer_parts)
-    except Exception as e:
-        print(f"\n[LLM Error] {type(e).__name__}: {e}", file=sys.stderr)
+            print(f"\n[LLM Error] {type(e).__name__}: {e}", file=sys.stderr)
+            return "".join(locals().get("answer_parts", []))
 
     # Fallback: non-streaming
     answer = _call_llm(prompt, model=model)

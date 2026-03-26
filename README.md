@@ -329,6 +329,27 @@ Yes. `codechat ingest --reset` to rebuild.
 - Only LLM calls go to external API (DashScope/OpenAI/Ollama)
 - File paths validated against project root (no path traversal)
 - Regex patterns limited to prevent ReDoS
+- **⚠️ Agent Modification Tools:** The `agent` mode provides `write_file` and `search_replace` tools that allow the LLM to directly modify your source code. **Always commit your code or use version control before running the agent.** You can disable these tools by using standard RAG commands like `ask` instead of `agent` if you only want read-only access.
+
+## Recent Updates (v0.2.0)
+
+**Performance & Stability**
+- **Thread Safety**: Fixed race conditions in `stderr` filtering and file chunk merging during multi-threaded ingestion.
+- **BM25 Optimization**: Switched to boolean masking for `remove_documents` to avoid O(N) rebuilding, drastically speeding up incremental indexing on large codebases.
+- **LLM Retries**: Added exponential backoff retry mechanisms for all LLM API calls to handle network fluctuations and unstable local instances.
+- **Code Deduplication**: Unified HuggingFace model loading logic across embedding and reranking modules.
+
+**Configuration & DX**
+- **Environment Variables**: Added native `.env` file support via `python-dotenv`.
+- **Configurable History**: Added `CODECHAT_HISTORY_LIMIT` to customize the conversational memory window.
+- **HuggingFace Mirror**: HF mirror is now opt-in via `USE_HF_MIRROR=true` rather than hardcoded.
+- **Dependency Reduction**: Removed `prompt-toolkit` in favor of standard `readline` for a lighter installation footprint.
+
+**Security & Engineering**
+- **Privacy**: Added `.gitignore` to prevent accidental commits of `.codechat/` vector data.
+- **Type Checking**: Added PEP 561 `py.typed` marker.
+- **CI/CD**: Added GitHub Actions workflow for automated multi-version Python testing.
+- **PyPI Metadata**: Enriched `pyproject.toml` with classifiers, keywords, and project URLs.
 
 ## Roadmap
 

@@ -120,12 +120,8 @@ def ingest(
     deleted_rels = set(old_hashes.keys()) - current_rels
 
     # Remove chunks for deleted and changed files
-    removed_count = 0
-    for rel in deleted_rels:
-        removed_count += store.remove_by_file(rel)
-    for f in files_to_process:
-        rel = str(f.relative_to(root))
-        removed_count += store.remove_by_file(rel)
+    paths_to_remove = list(deleted_rels) + [str(f.relative_to(root)) for f in files_to_process]
+    removed_count = store.remove_by_files(paths_to_remove)
 
     # Report diff
     if old_hashes:
@@ -172,10 +168,11 @@ def ingest(
                         return chunk_file(rel, content, c_size, c_overlap)
                     return []
 
-                futures = [executor.submit(process_file, f) for f in files_to_process]
-                for future in concurrent.futures.as_completed(futures):
-                    chunks = future.result()
-                    new_chunks.extend(chunks)
+                # Use map to preserve file order for better embedding caching/batching
+                results = executor.map(process_file, files_to_process)
+                for chunks in results:
+                    if chunks:
+                        new_chunks.extend(chunks)
                     progress.advance(task)
 
     if new_chunks:
@@ -308,11 +305,6 @@ def ask(
 @click.option("--model", "-m", default=None, help="LLM model to use")
 def chat(path: str | None, context: int, model: str | None):
     """Start an interactive chat session with the codebase."""
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.history import InMemoryHistory
-    from prompt_toolkit.styles import Style
-    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-
     root = Path(path).resolve() if path else _find_project_root()
     store = VectorStore(root)
 
@@ -348,15 +340,17 @@ def chat(path: str | None, context: int, model: str | None):
         console.print(f"  History: [dim]Loaded {len(conversation_history)} past messages.[/]")
     console.print(f"  Type your questions, or [dim]/quit[/] to exit.\n")
 
-    style = Style.from_dict({
-        "prompt": "ansicyan bold",
-    })
-    history = InMemoryHistory()
-    session: PromptSession = PromptSession(history=history, style=style, auto_suggest=AutoSuggestFromHistory())
+    # Try to enable readline history
+    try:
+        import readline
+        readline.parse_and_bind('tab: complete')
+    except ImportError:
+        pass
 
     while True:
         try:
-            q = session.prompt([("class:prompt", "codechat> ")])
+            # Use simple input instead of prompt_toolkit
+            q = input("\033[1;36mcodechat> \033[0m")
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]Bye![/]")
             break
@@ -471,9 +465,10 @@ def chat(path: str | None, context: int, model: str | None):
         if result["answer"] and not result["answer"].startswith("No LLM configured"):
             conversation_history.append({"role": "user", "content": q})
             conversation_history.append({"role": "assistant", "content": result["answer"]})
-            # Keep only the last 20 messages (10 turns) to prevent file from growing infinitely
-            if len(conversation_history) > 20:
-                conversation_history = conversation_history[-20:]
+            # Keep history configurable to prevent file from growing infinitely
+            limit = int(os.environ.get("CODECHAT_HISTORY_LIMIT", "10"))
+            if len(conversation_history) > limit * 2:
+                conversation_history = conversation_history[-limit * 2:]
             _save_history()
 
         if result["sources"]:

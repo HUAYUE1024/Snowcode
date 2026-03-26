@@ -9,11 +9,66 @@ from collections import Counter
 import hashlib
 import json
 import sys
+import os
+import warnings
+import threading
+from contextlib import contextmanager
 
 import numpy as np
 
 from .chunker import Chunk
 from .config import DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANK_MODEL, get_codechat_dir
+
+
+_MODEL_LOAD_LOCK = threading.Lock()
+
+@contextmanager
+def _suppress_stderr():
+    """Context manager to filter stderr output thread-safely using a lock."""
+    with _MODEL_LOAD_LOCK:
+        _orig_stderr = sys.stderr
+        _filter_keys = ("LOAD REPORT", "UNEXPECTED", "Notes:", "embeddings.position", "--------+")
+
+        class _StderrFilter:
+            def write(self, text):
+                if any(k in text for k in _filter_keys):
+                    return
+                _orig_stderr.write(text)
+            def flush(self):
+                _orig_stderr.flush()
+
+        sys.stderr = _StderrFilter()
+        try:
+            yield
+        finally:
+            sys.stderr = _orig_stderr
+
+def _load_hf_model(model_name: str, model_class, use_hf_mirror: bool = True):
+    """Generic function to load a HuggingFace model with proper env vars and stderr filtering."""
+    # Save original env vars to restore after loading
+    _saved_env = {}
+    _ssl_vars = ("CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
+    for k in _ssl_vars:
+        _saved_env[k] = os.environ.get(k)
+
+    # HuggingFace mirror for China users (if configured)
+    if use_hf_mirror and "HF_ENDPOINT" not in os.environ:
+        if os.environ.get("USE_HF_MIRROR", "false").lower() in ("true", "1", "yes"):
+            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+        
+    warnings.filterwarnings("ignore", message=".*UNEXPECTED.*")
+    
+    with _suppress_stderr():
+        model = model_class(model_name)
+
+    # Restore original SSL env vars
+    for k in _ssl_vars:
+        if _saved_env[k] is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = _saved_env[k]
+
+    return model
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -71,18 +126,21 @@ class BM25:
         if not indices_to_remove:
             return
             
+        # Efficient removal using boolean indexing
+        mask = np.ones(self.corpus_size, dtype=bool)
         for idx in indices_to_remove:
-            freqs = self.doc_freqs[idx]
-            for token in freqs:
-                self.df[token] -= 1
-                if self.df[token] <= 0:
-                    del self.df[token]
+            if 0 <= idx < self.corpus_size:
+                mask[idx] = False
+                freqs = self.doc_freqs[idx]
+                for token in freqs:
+                    self.df[token] -= 1
+                    if self.df[token] <= 0:
+                        del self.df[token]
                     
-        keep_indices = [i for i in range(self.corpus_size) if i not in indices_to_remove]
-        self.doc_freqs = [self.doc_freqs[i] for i in keep_indices]
-        self.doc_len = [self.doc_len[i] for i in keep_indices]
+        self.doc_freqs = [self.doc_freqs[i] for i, m in enumerate(mask) if m]
+        self.doc_len = [self.doc_len[i] for i, m in enumerate(mask) if m]
         
-        self.corpus_size = len(keep_indices)
+        self.corpus_size = len(self.doc_freqs)
         if self.corpus_size > 0:
             self.avgdl = sum(self.doc_len) / self.corpus_size
         else:
@@ -176,46 +234,9 @@ class VectorStore:
         """Lazy-load the sentence-transformer model."""
         if self._model is not None:
             return self._model
-        import os
-        import warnings
-
-        # Save original env vars to restore after loading
-        _saved_env = {}
-        _ssl_vars = ("CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
-        for k in _ssl_vars:
-            _saved_env[k] = os.environ.get(k)
-
-        # HuggingFace mirror for China users
-        if "HF_ENDPOINT" not in os.environ:
-            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
             
-        warnings.filterwarnings("ignore", message=".*UNEXPECTED.*")
-
-        # Filter stderr: keep progress bars, suppress LOAD REPORT noise
-        _orig_stderr = sys.stderr
-        _filter_keys = ("LOAD REPORT", "UNEXPECTED", "Notes:", "embeddings.position", "--------+")
-
-        class _StderrFilter:
-            def write(self, text):
-                if any(k in text for k in _filter_keys):
-                    return
-                _orig_stderr.write(text)
-            def flush(self):
-                _orig_stderr.flush()
-
-        sys.stderr = _StderrFilter()
-        try:
-            from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer(self._model_name)
-        finally:
-            sys.stderr = _orig_stderr
-            # Restore original SSL env vars
-            for k in _ssl_vars:
-                if _saved_env[k] is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = _saved_env[k]
-
+        from sentence_transformers import SentenceTransformer
+        self._model = _load_hf_model(self._model_name, SentenceTransformer)
         return self._model
 
     def _get_rerank_model(self):
@@ -223,45 +244,8 @@ class VectorStore:
         if self._rerank_model is not None:
             return self._rerank_model
             
-        import os
-        import warnings
-        
-        # Save original env vars to restore after loading
-        _saved_env = {}
-        _ssl_vars = ("CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
-        for k in _ssl_vars:
-            _saved_env[k] = os.environ.get(k)
-
-        # HuggingFace mirror for China users
-        if "HF_ENDPOINT" not in os.environ:
-            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-            
-        warnings.filterwarnings("ignore", message=".*UNEXPECTED.*")
-        
-        _orig_stderr = sys.stderr
-        _filter_keys = ("LOAD REPORT", "UNEXPECTED", "Notes:", "embeddings.position", "--------+")
-
-        class _StderrFilter:
-            def write(self, text):
-                if any(k in text for k in _filter_keys):
-                    return
-                _orig_stderr.write(text)
-            def flush(self):
-                _orig_stderr.flush()
-
-        sys.stderr = _StderrFilter()
-        try:
-            from sentence_transformers import CrossEncoder
-            self._rerank_model = CrossEncoder(self._rerank_model_name)
-        finally:
-            sys.stderr = _orig_stderr
-            # Restore original SSL env vars
-            for k in _ssl_vars:
-                if _saved_env[k] is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = _saved_env[k]
-
+        from sentence_transformers import CrossEncoder
+        self._rerank_model = _load_hf_model(self._rerank_model_name, CrossEncoder)
         return self._rerank_model
 
     def _embed(self, texts: list[str]) -> np.ndarray:
@@ -381,14 +365,20 @@ class VectorStore:
 
     def remove_by_file(self, file_path: str) -> int:
         """Remove all chunks for a specific file. Returns count removed."""
-        if self._embeddings is None or not self._ids:
+        return self.remove_by_files([file_path])
+
+    def remove_by_files(self, file_paths: list[str]) -> int:
+        """Remove all chunks for a list of files. Returns count removed."""
+        if self._embeddings is None or not self._ids or not file_paths:
             return 0
 
+        target_paths = set(file_paths)
         keep_indices = []
         remove_indices = set()
         removed = 0
+        
         for i, meta in enumerate(self._metadata):
-            if meta["file_path"] == file_path:
+            if meta["file_path"] in target_paths:
                 removed += 1
                 remove_indices.add(i)
             else:

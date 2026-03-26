@@ -3,6 +3,23 @@
 import json
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env file if it exists in the current directory or its parents
+def _init_dotenv():
+    # Find project root similar to cli.py but simpler
+    markers = [".git", "pyproject.toml", "package.json", ".codechat", ".env"]
+    cwd = Path.cwd()
+    for parent in [cwd, *cwd.parents]:
+        env_path = parent / ".env"
+        if env_path.exists():
+            load_dotenv(env_path)
+            return
+        if any((parent / m).exists() for m in markers):
+            # If we found a project root but no .env, stop looking
+            return
+
+_init_dotenv()
 
 # Code file extensions to ingest
 CODE_EXTENSIONS = {
