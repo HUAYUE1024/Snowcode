@@ -499,6 +499,39 @@ class ToolRegistry:
             return ToolResult(False, f"{type(e).__name__}: {e}", name, elapsed)
 
 
+class DeleteFileTool(Tool):
+    """Tool to delete a file."""
+    name = "delete_file"
+    description = "删除指定文件"
+
+    @property
+    def parameters(self):
+        return {"path": "要删除的文件路径"}
+
+    def run(self, params: dict, ctx: dict) -> str:
+        root: Path = ctx["root"]
+        path = params.get("path", "")
+        if not path:
+            return "Error: path required"
+        full = (root / path).resolve()
+        if not full.is_relative_to(root):
+            return f"Access denied: path outside project root"
+        if not full.exists():
+            return f"File not found: {path}"
+        if full.is_dir():
+            return f"Error: {path} is a directory, not a file"
+        try:
+            import shutil
+            # Backup before deleting
+            backup = full.with_suffix(full.suffix + ".deleted")
+            shutil.copy2(full, backup)
+            full.unlink()
+            rel = str(full.relative_to(root))
+            return f"Deleted `{rel}` (backup saved as {backup.name})"
+        except Exception as e:
+            return f"Error deleting: {e}"
+
+
 def build_default_registry() -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(SearchTool())
@@ -508,6 +541,7 @@ def build_default_registry() -> ToolRegistry:
     reg.register(ReadMultipleTool())
     reg.register(WriteFileTool())
     reg.register(SearchReplaceTool())
+    reg.register(DeleteFileTool())
     return reg
 
 
