@@ -178,7 +178,10 @@ def chunk_file(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     overlap: int = DEFAULT_CHUNK_OVERLAP,
 ) -> list[Chunk]:
-    """Split a file's content into chunks with metadata."""
+    """Split a file's content into chunks with metadata.
+
+    Strategy: AST (Tree-sitter) → regex function splitter → line-based
+    """
     lines = content.splitlines()
     total_lines = len(lines)
 
@@ -194,9 +197,31 @@ def chunk_file(
             )]
         return []
 
-    # For medium files, try function-level splitting
+    # Try AST-aware splitting first
+    try:
+        from .ast_chunker import ast_split_definitions
+        ast_chunks = ast_split_definitions(file_path, content, chunk_size)
+        if ast_chunks and len(ast_chunks) > 1:
+            final: list[Chunk] = []
+            for sub_content, start_line, end_line in ast_chunks:
+                if sub_content.strip():
+                    final.append(Chunk(
+                        content=sub_content,
+                        file_path=file_path,
+                        start_line=start_line,
+                        end_line=end_line,
+                        chunk_index=len(final),
+                    ))
+            if final:
+                return final
+    except Exception:
+        pass
+
+    # Fallback: regex function splitting
+    fn_chunks = _split_by_functions(content)
+
+    # For medium files, return function chunks directly
     if len(content) <= chunk_size * 3:
-        fn_chunks = _split_by_functions(content)
         final: list[Chunk] = []
         for sub_content, start_line, end_line in fn_chunks:
             if sub_content.strip():
@@ -210,7 +235,6 @@ def chunk_file(
         return final
 
     # For large files: function splitting, then line-based for oversized chunks
-    fn_chunks = _split_by_functions(content)
     final_chunks: list[Chunk] = []
     for sub_content, start_line, end_line in fn_chunks:
         if len(sub_content) <= chunk_size * 1.5:
