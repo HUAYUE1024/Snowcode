@@ -223,7 +223,7 @@ def stream_llm(
     try:
         import openai
         client = openai.OpenAI(api_key=api_key, base_url=base_url)
-            stream = client.chat.completions.create(
+        stream = client.chat.completions.create(
                 model=llm_model,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
