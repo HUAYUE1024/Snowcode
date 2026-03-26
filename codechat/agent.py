@@ -536,7 +536,7 @@ class ShortTermMemory:
             # Keep first (goal) and last N
             self.entries = [self.entries[0]] + self.entries[-(self.max_entries - 1):]
 
-    def get_context(self, max_chars: int = 8000) -> str:
+    def get_context(self, max_chars: int = 30000) -> str:
         """Format memory into a string for the LLM, strictly bound by max_chars."""
         lines = []
         total = 0
@@ -985,11 +985,12 @@ class CodeAgent:
 
             result = self.executor.execute(tool_name, params, self.ctx)
 
-            preview = result.output[:150] + "..." if len(result.output) > 150 else result.output
+            preview = result.output[:200] + "..." if len(result.output) > 200 else result.output
             if on_step:
                 on_step(step + 1, tool_name, preview)
 
-            self.memory_st.add("tool", f"[{tool_name}] {result.output[:500]}", tool_name=tool_name)
+            # Store full tool output in memory (up to 8000 chars) so LLM can see complete file content
+            self.memory_st.add("tool", f"[{tool_name}] {result.output[:8000]}", tool_name=tool_name)
 
             # Repeat detection: same tool + same params = loop
             action_key = (tool_name, json.dumps(params, sort_keys=True, ensure_ascii=False)[:100])
