@@ -63,6 +63,8 @@ export DASHSCOPE_API_KEY=sk-xxx
 
 Default model: `qwen-flash`. See [LLM Config](#llm-config) for more options.
 
+**Smart chunking:** AST-first (Tree-sitter parses real function/class boundaries) → regex fallback → line-based fallback. Supports 20+ languages.
+
 ## Incremental Indexing
 
 By default, `ingest` only processes changed files:
@@ -305,7 +307,7 @@ Yes. `codechat ingest --reset` to rebuild.
 - [x] Streaming output + thinking mode
 - [x] Long-term memory persistence
 - [x] Incremental indexing (only changed files)
-- [ ] AST-aware chunking (Tree-sitter)
+- [x] AST-aware chunking (Tree-sitter, 20+ languages)
 - [ ] Multi-turn conversation memory
 - [ ] `.codechatignore` custom rules
 - [ ] Export Q&A to Markdown
