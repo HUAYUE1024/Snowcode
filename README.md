@@ -37,7 +37,7 @@ codechat chat                                # interactive REPL
 
 | Command | Description |
 |---------|-------------|
-| `ingest` | Scan project files, build local vector index |
+| `ingest` | Scan project files, build local vector index (incremental by default) |
 | `ask "question"` | Ask about the codebase (streaming output) |
 | `agent "question"` | Multi-step agent: Plan → Tools → Memory → Answer |
 | `chat` | Interactive REPL with history and auto-complete |
@@ -62,6 +62,26 @@ export DASHSCOPE_API_KEY=sk-xxx
 ```
 
 Default model: `qwen-flash`. See [LLM Config](#llm-config) for more options.
+
+## Incremental Indexing
+
+By default, `ingest` only processes changed files:
+
+```bash
+codechat ingest          # incremental: new/changed/deleted files only
+codechat ingest --reset  # full rebuild
+```
+
+**How it works:**
+1. Each file's hash (mtime + size) is stored in `.codechat/file_hashes.json`
+2. On subsequent runs, hashes are compared to detect changes
+3. Only changed/new files are re-chunked and re-embedded
+4. Chunks from deleted files are automatically removed
+5. Unchanged files are completely skipped
+
+```
+Files: 42 total, 38 unchanged, 3 changed/new, 1 deleted
+```
 
 ## Agent Mode
 
@@ -284,7 +304,7 @@ Yes. `codechat ingest --reset` to rebuild.
 - [x] 7 specialized skills
 - [x] Streaming output + thinking mode
 - [x] Long-term memory persistence
-- [ ] Incremental indexing (only changed files)
+- [x] Incremental indexing (only changed files)
 - [ ] AST-aware chunking (Tree-sitter)
 - [ ] Multi-turn conversation memory
 - [ ] `.codechatignore` custom rules
