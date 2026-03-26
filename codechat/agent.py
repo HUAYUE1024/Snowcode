@@ -127,10 +127,14 @@ class ReadFileTool(Tool):
         path = params.get("path", "")
         if not path:
             return "Error: path required"
-        full = root / path
+        # Resolve and validate path is within project root
+        full = (root / path).resolve()
+        if not full.is_relative_to(root):
+            return f"Access denied: path outside project root"
         if not full.exists():
-            # try glob
-            matches = list(root.rglob(Path(path).name))
+            # try glob within root only
+            name = Path(path).name
+            matches = [m for m in root.rglob(name) if m.resolve().is_relative_to(root)]
             if matches:
                 full = matches[0]
             else:
@@ -160,7 +164,13 @@ class FindPatternTool(Tool):
         pattern = params.get("pattern", "")
         if not pattern:
             return "Error: pattern required"
-        regex = re.compile(pattern)
+        # Limit pattern length to prevent ReDoS
+        if len(pattern) > 200:
+            return "Error: pattern too long (max 200 chars)"
+        try:
+            regex = re.compile(pattern)
+        except re.error as e:
+            return f"Invalid regex: {e}"
         file_glob = params.get("file_glob")
         matches = []
         files = scan_files(root)
@@ -173,9 +183,14 @@ class FindPatternTool(Tool):
             if content is None:
                 continue
             for i, line in enumerate(content.splitlines(), 1):
-                if regex.search(line):
-                    rel = str(f.relative_to(root))
-                    matches.append(f"`{rel}:{i}`  {line.strip()}")
+                # Truncate long lines to prevent ReDoS
+                search_line = line[:500]
+                try:
+                    if regex.search(search_line):
+                        rel = str(f.relative_to(root))
+                        matches.append(f"`{rel}:{i}`  {line.strip()}")
+                except Exception:
+                    continue
             if len(matches) >= 30:
                 break
         return "\n".join(matches[:30]) if matches else "No matches."
@@ -248,7 +263,10 @@ class ReadMultipleTool(Tool):
                     s, e = 1, 9999
             else:
                 fp, s, e = item, 1, 9999
-            full = root / fp
+            full = (root / fp).resolve()
+            if not full.is_relative_to(root):
+                parts.append(f"Access denied: {fp}")
+                continue
             if not full.exists():
                 parts.append(f"Not found: {fp}")
                 continue

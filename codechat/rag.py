@@ -105,6 +105,12 @@ def _get_llm_config(model: str | None = None) -> tuple[str, str, str, bool]:
         oa_model = model or os.environ.get("CODECHAT_MODEL", "gpt-4o-mini")
         return oa_key, oa_url, oa_model, False
 
+    # Ollama (local)
+    ollama_url = os.environ.get("OLLAMA_URL")
+    if ollama_url:
+        ollama_model = model or os.environ.get("OLLAMA_MODEL", "codellama")
+        return "ollama", ollama_url, ollama_model, False
+
     return "", "", "", False
 
 
@@ -113,43 +119,46 @@ def _call_llm(prompt: str, model: str | None = None, _system_override: str | Non
     api_key, base_url, llm_model, thinking = _get_llm_config(model)
     system_msg = _system_override or SYSTEM_PROMPT
 
-    if api_key:
+    if not api_key:
+        return ""
+
+    # Ollama uses httpx, not openai SDK
+    if api_key == "ollama":
         try:
-            import openai
-            client = openai.OpenAI(api_key=api_key, base_url=base_url)
-            resp = client.chat.completions.create(
-                model=llm_model,
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.1,
-                max_tokens=4096,
-                extra_body={"enable_thinking": thinking} if thinking else {},
+            import httpx
+            resp = httpx.post(
+                f"{base_url}/api/chat",
+                json={
+                    "model": llm_model,
+                    "messages": [
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "stream": False,
+                },
+                timeout=120,
             )
-            return resp.choices[0].message.content or ""
+            if resp.status_code == 200:
+                return resp.json()["message"]["content"]
         except Exception as e:
             print(f"\n[LLM Error] {type(e).__name__}: {e}", file=sys.stderr)
+        return ""
 
-    # Try Ollama
-    ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-    ollama_model = os.environ.get("OLLAMA_MODEL", "codellama")
+    # OpenAI-compatible API
     try:
-        import httpx
-        resp = httpx.post(
-            f"{ollama_url}/api/chat",
-            json={
-                "model": ollama_model,
-                "messages": [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": prompt},
-                ],
-                "stream": False,
-            },
-            timeout=120,
+        import openai
+        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        resp = client.chat.completions.create(
+            model=llm_model,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=4096,
+            extra_body={"enable_thinking": thinking} if thinking else {},
         )
-        if resp.status_code == 200:
-            return resp.json()["message"]["content"]
+        return resp.choices[0].message.content or ""
     except Exception as e:
         print(f"\n[LLM Error] {type(e).__name__}: {e}", file=sys.stderr)
 
@@ -170,10 +179,50 @@ def stream_llm(
     """
     api_key, base_url, llm_model, thinking = _get_llm_config(model)
 
-    if api_key:
+    if not api_key:
+        # Fallback to non-streaming
+        answer = _call_llm(prompt, model=model)
+        if answer and on_answer:
+            on_answer(answer)
+        return answer
+
+    # Ollama: use httpx streaming
+    if api_key == "ollama":
         try:
-            import openai
-            client = openai.OpenAI(api_key=api_key, base_url=base_url)
+            import httpx
+            answer_parts: list[str] = []
+            with httpx.stream(
+                "POST",
+                f"{base_url}/api/chat",
+                json={
+                    "model": llm_model,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "stream": True,
+                },
+                timeout=120,
+            ) as resp:
+                for line in resp.iter_lines():
+                    if line:
+                        try:
+                            data = json.loads(line)
+                            content = data.get("message", {}).get("content", "")
+                            if content:
+                                answer_parts.append(content)
+                                if on_answer:
+                                    on_answer(content)
+                        except json.JSONDecodeError:
+                            continue
+            return "".join(answer_parts)
+        except Exception as e:
+            print(f"\n[LLM Error] {type(e).__name__}: {e}", file=sys.stderr)
+
+    # OpenAI-compatible streaming
+    try:
+        import openai
+        client = openai.OpenAI(api_key=api_key, base_url=base_url)
             stream = client.chat.completions.create(
                 model=llm_model,
                 messages=[

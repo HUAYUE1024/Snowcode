@@ -36,8 +36,8 @@ SKIP_DIRS = {
 MAX_FILE_SIZE = 1_000_000  # 1MB
 
 # Default chunk settings
-DEFAULT_CHUNK_SIZE = 1500
-DEFAULT_CHUNK_OVERLAP = 200
+DEFAULT_CHUNK_SIZE = 1500       # characters per chunk
+DEFAULT_CHUNK_OVERLAP = 5       # lines of overlap between chunks
 
 # Embedding model — all-mpnet-base-v2 for better code retrieval quality
 DEFAULT_EMBEDDING_MODEL = "all-mpnet-base-v2"
