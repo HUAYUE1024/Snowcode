@@ -105,7 +105,7 @@ class BM25:
 class VectorStore:
     """Local vector store backed by NumPy + JSON — no external DB, no HNSW issues."""
 
-    def __init__(self, project_root: Path, embedding_model: str = DEFAULT_EMBEDDING_MODEL):
+    def __init__(self, project_root: Path, embedding_model: str | None = None):
         self.project_root = project_root.resolve()
         self.codechat_dir = get_codechat_dir(self.project_root)
 
@@ -113,7 +113,23 @@ class VectorStore:
         self._metadata_path = self.codechat_dir / "metadata.json"
         self._hashes_path = self.codechat_dir / "file_hashes.json"
         self._bm25_path = self.codechat_dir / "bm25.json"
-        self._model_name = embedding_model
+        self._config_path = self.codechat_dir / "config.json"
+        
+        # Determine the model to use:
+        # 1. Passed explicitly (via CLI arg)
+        # 2. Loaded from config.json (previous ingest)
+        # 3. Default fallback
+        if embedding_model:
+            self._model_name = embedding_model
+        else:
+            if self._config_path.exists():
+                try:
+                    conf = json.loads(self._config_path.read_text(encoding="utf-8"))
+                    self._model_name = conf.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
+                except Exception:
+                    self._model_name = DEFAULT_EMBEDDING_MODEL
+            else:
+                self._model_name = DEFAULT_EMBEDDING_MODEL
 
         self._model = None  # lazy load
 
@@ -347,6 +363,13 @@ class VectorStore:
 
         # Vector search
         q_vec = self._embed([text])[0]
+        
+        # Guard against dimension mismatch
+        if self._embeddings.shape[1] != q_vec.shape[0]:
+            print(f"\n[Warning] Embedding dimension mismatch (Index: {self._embeddings.shape[1]}, Query: {q_vec.shape[0]}). "
+                  f"Please run `codechat ingest --reset` to rebuild the index.", file=sys.stderr)
+            return []
+            
         vec_sims = _cosine_similarity(q_vec, self._embeddings)
         
         # BM25 keyword search
