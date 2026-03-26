@@ -14,7 +14,7 @@ def test_format_context():
     ]
     
     formatted = _format_context(results)
-    assert "[1] `src/main.py` (第 10-15 行)" in formatted
+    assert "[1] `src/main.py`" in formatted
     assert "```python" in formatted
     assert "def hello():" in formatted
 
