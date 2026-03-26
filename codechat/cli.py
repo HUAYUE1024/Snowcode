@@ -17,8 +17,10 @@ if sys.platform == "win32":
         pass
 
 import click
+import json
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.live import Live
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 from rich.table import Table
@@ -242,30 +244,27 @@ def ask(
             console.print("[dim]=== Thinking ===[/]")
 
         think_buf: list[str] = []
-        answer_buf: list[str] = []
+        markdown_content = ""
         in_answer = False
 
-        def on_think(token: str):
-            nonlocal in_answer
-            if not in_answer and token.strip():
-                think_buf.append(token)
-                if show_thinking:
-                    console.print(f"[dim]{token}[/]", end="")
+        with Live(Markdown(""), console=console, refresh_per_second=10) as live:
+            def on_think(token: str):
+                nonlocal in_answer
+                if not in_answer and token.strip():
+                    think_buf.append(token)
 
-        def on_answer(token: str):
-            nonlocal in_answer
-            if not in_answer:
-                in_answer = True
-                if thinking and show_thinking and think_buf:
-                    console.print()
-                    console.print("[dim]=== Answer ===[/]")
-            answer_buf.append(token)
-            console.print(token, end="")
+            def on_answer(token: str):
+                nonlocal in_answer, markdown_content
+                if not in_answer:
+                    in_answer = True
+                        
+                markdown_content += token
+                live.update(Markdown(markdown_content))
 
-        result = answer_question_stream(
-            store, q, n_context=context, model=model,
-            on_think=on_think, on_answer=on_answer,
-        )
+            result = answer_question_stream(
+                store, q, n_context=context, model=model,
+                on_think=on_think, on_answer=on_answer,
+            )
         console.print()
     else:
         # No LLM - use non-streaming fallback
@@ -312,9 +311,32 @@ def chat(path: str | None, context: int, model: str | None):
         console.print("[red]No data indexed. Run [cyan]codechat ingest[/] first.[/]")
         return
 
+    codechat_dir = get_codechat_dir(root)
+    history_file = codechat_dir / "history.json"
+
+    def _save_history():
+        """Save conversation history to disk."""
+        try:
+            history_file.write_text(json.dumps(conversation_history, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_history():
+        """Load conversation history from disk."""
+        if history_file.exists():
+            try:
+                return json.loads(history_file.read_text(encoding="utf-8"))
+            except Exception:
+                return []
+        return []
+
+    conversation_history: list[dict] = _load_history()
+
     console.print(f"\n[bold cyan]codechat[/] v{__version__} - Interactive Mode")
     console.print(f"  Project: [green]{root}[/]")
     console.print(f"  Chunks:  [dim]{store.count()}[/]")
+    if conversation_history:
+        console.print(f"  History: [dim]Loaded {len(conversation_history)} past messages.[/]")
     console.print(f"  Type your questions, or [dim]/quit[/] to exit.\n")
 
     style = Style.from_dict({
@@ -338,18 +360,61 @@ def chat(path: str | None, context: int, model: str | None):
             console.print("[dim]Bye![/]")
             break
 
+        if q in {"/cls", "/clear_screen"}:
+            console.clear()
+            continue
+
         if q == "/reset":
             store.reset()
-            console.print("[yellow]Index reset.[/]")
+            conversation_history.clear()
+            console.print("[yellow]Index and conversation history reset.[/]")
+            continue
+
+        if q.startswith("/export"):
+            parts = q.split(" ", 1)
+            filename = parts[1].strip() if len(parts) > 1 else "codechat_export.md"
+            
+            if not conversation_history:
+                console.print("[yellow]No conversation history to export.[/]")
+                continue
+                
+            try:
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write(f"# codechat Q&A Export\n\n")
+                    for msg in conversation_history:
+                        role = "User" if msg["role"] == "user" else "codechat"
+                        f.write(f"## {role}\n\n{msg['content']}\n\n")
+                console.print(f"[green]Successfully exported Q&A to [bold]{filename}[/][/]")
+            except Exception as e:
+                console.print(f"[red]Failed to export: {e}[/]")
+            continue
+
+        if q == "/clear":
+            conversation_history.clear()
+            _save_history()
+            console.print("[yellow]Conversation history cleared.[/]")
+            continue
+
+        if q == "/load":
+            conversation_history = _load_history()
+            if conversation_history:
+                console.print(f"[green]Loaded {len(conversation_history)} messages from history.[/]")
+            else:
+                console.print("[yellow]No history found.[/]")
             continue
 
         if q == "/stats":
             console.print(f"  Chunks: [bold]{store.count()}[/]")
+            console.print(f"  History messages: [bold]{len(conversation_history)}[/]")
             continue
 
         if q == "/help":
             console.print("  [cyan]/quit[/]    Exit")
-            console.print("  [cyan]/reset[/]   Clear the index")
+            console.print("  [cyan]/cls[/]     Clear the terminal screen")
+            console.print("  [cyan]/clear[/]   Clear conversation history")
+            console.print("  [cyan]/load[/]    Load history from disk")
+            console.print("  [cyan]/export[/]  Export Q&A to Markdown (e.g. /export file.md)")
+            console.print("  [cyan]/reset[/]   Clear the index and history")
             console.print("  [cyan]/stats[/]   Show index stats")
             console.print("  [cyan]/help[/]    Show this help")
             continue
@@ -362,29 +427,42 @@ def chat(path: str | None, context: int, model: str | None):
             if thinking:
                 console.print("[dim]=== Thinking ===[/]")
             is_answer = False
+            
+            markdown_content = ""
+            
+            with Live(Markdown(""), console=console, refresh_per_second=10) as live:
+                def _on_think(t: str):
+                    nonlocal is_answer
+                    if not is_answer and t.strip():
+                        # Live cannot easily mix raw text and Markdown, so we handle thinking normally
+                        # but in Live context we just update the live display
+                        pass
 
-            def _on_think(t: str):
-                nonlocal is_answer
-                if not is_answer and t.strip():
-                    console.print(f"[dim]{t}[/]", end="")
+                def _on_answer(t: str):
+                    nonlocal is_answer, markdown_content
+                    if not is_answer:
+                        is_answer = True
+                        if thinking:
+                            console.print("[dim]=== Answer ===[/]")
+                    
+                    markdown_content += t
+                    live.update(Markdown(markdown_content))
 
-            def _on_answer(t: str):
-                nonlocal is_answer
-                if not is_answer:
-                    is_answer = True
-                    console.print()
-                    console.print("[dim]=== Answer ===[/]")
-                console.print(t, end="")
-
-            result = answer_question_stream(
-                store, q, n_context=context, model=model,
-                on_think=_on_think, on_answer=_on_answer,
-            )
+                result = answer_question_stream(
+                    store, q, n_context=context, model=model,
+                    on_think=_on_think, on_answer=_on_answer,
+                    history=conversation_history
+                )
             console.print()
         else:
-            result = answer_question(store, q, n_context=context, model=model)
+            result = answer_question(store, q, n_context=context, model=model, history=conversation_history)
             console.print()
             console.print(Markdown(result["answer"]))
+
+        if result["answer"] and not result["answer"].startswith("No LLM configured"):
+            conversation_history.append({"role": "user", "content": q})
+            conversation_history.append({"role": "assistant", "content": result["answer"]})
+            _save_history()
 
         if result["sources"]:
             console.print("\n[bold dim]Sources:[/]")
@@ -461,22 +539,24 @@ def _run_skill_common(skill_name: str, target: str, path: str | None, model: str
 
     if api_key:
         console.print()
+        markdown_content = ""
         is_answer = False
 
-        def on_think(t: str):
-            nonlocal is_answer
-            if not is_answer and t.strip():
-                console.print(f"[dim]{t}[/]", end="")
+        with Live(Markdown(""), console=console, refresh_per_second=10) as live:
+            def on_think(t: str):
+                nonlocal is_answer
+                if not is_answer and t.strip():
+                    pass
 
-        def on_answer(t: str):
-            nonlocal is_answer
-            if not is_answer:
-                is_answer = True
-                if thinking:
-                    console.print()
-            console.print(t, end="")
+            def on_answer(t: str):
+                nonlocal is_answer, markdown_content
+                if not is_answer:
+                    is_answer = True
+                
+                markdown_content += t
+                live.update(Markdown(markdown_content))
 
-        result = run_skill_stream(store, skill_name, target, model=model, on_think=on_think, on_answer=on_answer)
+            result = run_skill_stream(store, skill_name, target, model=model, on_think=on_think, on_answer=on_answer)
         console.print()
     else:
         with console.status("[bold cyan]Analyzing...", spinner="dots"):

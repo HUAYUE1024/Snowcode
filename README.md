@@ -51,6 +51,21 @@ codechat chat                                # interactive REPL
 | `status` | Show index status |
 | `clean` | Delete the vector index |
 
+## Chat REPL Commands
+
+Inside the interactive `codechat chat` mode, you can use the following commands:
+
+| Command | Description |
+|---------|-------------|
+| `/quit`, `/exit`, `/q` | Exit the chat session |
+| `/cls` | Clear the terminal screen |
+| `/clear` | Clear the current conversation history (memory) |
+| `/load` | Reload the conversation history from disk |
+| `/export [file]` | Export the Q&A session to a Markdown file (default: `codechat_export.md`) |
+| `/reset` | Clear the vector index and conversation history |
+| `/stats` | Show index and history statistics |
+| `/help` | Show available commands |
+
 ## Setup LLM
 
 ```cmd
@@ -277,6 +292,8 @@ your-project/
 
 **Auto-skipped:** `.git` `node_modules` `__pycache__` `.venv` `dist` `build` `.codechat`
 
+**Custom Ignore:** You can create a `.codechatignore` file in your project root to define custom ignore rules using standard `.gitignore` syntax.
+
 ## FAQ
 
 **Q: Does it work without an LLM?**
@@ -308,10 +325,12 @@ Yes. `codechat ingest --reset` to rebuild.
 - [x] Long-term memory persistence
 - [x] Incremental indexing (only changed files)
 - [x] AST-aware chunking (Tree-sitter, 20+ languages)
-- [ ] Multi-turn conversation memory
-- [ ] `.codechatignore` custom rules
-- [ ] Export Q&A to Markdown
-- [ ] Test suite
+- [x] Multi-turn conversation memory
+- [x] `.codechatignore` custom rules
+- [x] Export Q&A to Markdown
+- [x] Test suite
+- [x] Hybrid Search (Vector + BM25)
+- [x] Streaming Markdown rendering (Rich Live)
 
 ## License
 

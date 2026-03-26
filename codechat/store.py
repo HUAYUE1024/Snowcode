@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import math
+import re
+from pathlib import Path
+from collections import Counter
 import hashlib
 import json
 import sys
-from pathlib import Path
 
 import numpy as np
 
@@ -20,6 +23,85 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return b_norm @ a_norm
 
 
+def _tokenize(text: str) -> list[str]:
+    """Simple tokenizer for BM25."""
+    text = text.lower()
+    # Extract words, camelCase/snake_case parts
+    words = re.findall(r'[a-zA-Z0-9]+', text)
+    return [w for w in words if len(w) > 1]
+
+
+class BM25:
+    """Simple BM25 implementation for keyword search."""
+    
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self.doc_freqs: list[dict[str, int]] = []
+        self.df: dict[str, int] = Counter()
+        self.doc_len: list[int] = []
+        self.avgdl = 0.0
+        self.corpus_size = 0
+        
+    def fit(self, corpus: list[str]):
+        self.corpus_size = len(corpus)
+        if self.corpus_size == 0:
+            return
+            
+        self.doc_freqs = []
+        self.doc_len = []
+        
+        for doc in corpus:
+            tokens = _tokenize(doc)
+            self.doc_len.append(len(tokens))
+            freqs = Counter(tokens)
+            self.doc_freqs.append(freqs)
+            for token in freqs:
+                self.df[token] += 1
+                
+        self.avgdl = sum(self.doc_len) / self.corpus_size
+        
+    def score(self, query: str) -> np.ndarray:
+        if self.corpus_size == 0:
+            return np.array([])
+            
+        q_tokens = _tokenize(query)
+        scores = np.zeros(self.corpus_size, dtype=np.float32)
+        
+        for token in q_tokens:
+            if token not in self.df:
+                continue
+                
+            idf = math.log((self.corpus_size - self.df[token] + 0.5) / (self.df[token] + 0.5) + 1.0)
+            
+            for i, doc_freq in enumerate(self.doc_freqs):
+                if token in doc_freq:
+                    tf = doc_freq[token]
+                    doc_len = self.doc_len[i]
+                    # BM25 formula
+                    numerator = tf * (self.k1 + 1)
+                    denominator = tf + self.k1 * (1 - self.b + self.b * (doc_len / self.avgdl))
+                    scores[i] += idf * (numerator / denominator)
+                    
+        return scores
+        
+    def to_dict(self) -> dict:
+        return {
+            "df": dict(self.df),
+            "doc_len": self.doc_len,
+            "doc_freqs": [dict(df) for df in self.doc_freqs],
+            "corpus_size": self.corpus_size,
+            "avgdl": self.avgdl
+        }
+        
+    def from_dict(self, data: dict):
+        self.df = Counter(data.get("df", {}))
+        self.doc_len = data.get("doc_len", [])
+        self.doc_freqs = [Counter(df) for df in data.get("doc_freqs", [])]
+        self.corpus_size = data.get("corpus_size", 0)
+        self.avgdl = data.get("avgdl", 0.0)
+
+
 class VectorStore:
     """Local vector store backed by NumPy + JSON — no external DB, no HNSW issues."""
 
@@ -30,6 +112,7 @@ class VectorStore:
         self._embeddings_path = self.codechat_dir / "embeddings.npy"
         self._metadata_path = self.codechat_dir / "metadata.json"
         self._hashes_path = self.codechat_dir / "file_hashes.json"
+        self._bm25_path = self.codechat_dir / "bm25.json"
         self._model_name = embedding_model
 
         self._model = None  # lazy load
@@ -37,6 +120,8 @@ class VectorStore:
         self._embeddings: np.ndarray | None = None
         self._metadata: list[dict] = []
         self._ids: list[str] = []
+        self._bm25 = BM25()
+        self._texts: list[str] = []  # needed for BM25 fit
 
         self._load()
 
@@ -105,23 +190,41 @@ class VectorStore:
                 raw = json.loads(self._metadata_path.read_text(encoding="utf-8"))
                 self._ids = raw.get("ids", [])
                 self._metadata = raw.get("metadata", [])
+                self._texts = raw.get("texts", [])
+                
+                if self._bm25_path.exists():
+                    bm25_data = json.loads(self._bm25_path.read_text(encoding="utf-8"))
+                    self._bm25.from_dict(bm25_data)
+                elif self._texts:
+                    self._bm25.fit(self._texts)
             except Exception:
                 self._embeddings = None
                 self._metadata = []
                 self._ids = []
+                self._texts = []
+                self._bm25 = BM25()
 
     def _save(self) -> None:
         """Persist current data to disk."""
         if self._embeddings is not None and len(self._embeddings) > 0:
             np.save(str(self._embeddings_path), self._embeddings)
             self._metadata_path.write_text(
-                json.dumps({"ids": self._ids, "metadata": self._metadata}, ensure_ascii=False),
+                json.dumps({
+                    "ids": self._ids, 
+                    "metadata": self._metadata,
+                    "texts": self._texts
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self._bm25_path.write_text(
+                json.dumps(self._bm25.to_dict(), ensure_ascii=False),
                 encoding="utf-8",
             )
         else:
             # Empty — remove files
             self._embeddings_path.unlink(missing_ok=True)
             self._metadata_path.unlink(missing_ok=True)
+            self._bm25_path.unlink(missing_ok=True)
 
     # -------------------------------------------------------------- file hashes
 
@@ -174,10 +277,15 @@ class VectorStore:
             self._embeddings = self._embeddings[keep_indices]
             self._metadata = [self._metadata[i] for i in keep_indices]
             self._ids = [self._ids[i] for i in keep_indices]
+            if self._texts:
+                self._texts = [self._texts[i] for i in keep_indices]
+                self._bm25.fit(self._texts)
         else:
             self._embeddings = None
             self._metadata = []
             self._ids = []
+            self._texts = []
+            self._bm25 = BM25()
 
         self._save()
         return removed
@@ -226,17 +334,31 @@ class VectorStore:
 
         self._ids.extend(dedup_ids)
         self._metadata.extend(dedup_meta)
+        self._texts.extend(dedup_texts)
+        self._bm25.fit(self._texts)
 
         self._save()
         return len(dedup_ids)
 
-    def query(self, text: str, n_results: int = 5) -> list[dict]:
-        """Search for similar code chunks using cosine similarity."""
+    def query(self, text: str, n_results: int = 5, hybrid_alpha: float = 0.5) -> list[dict]:
+        """Search for similar code chunks using hybrid search (Vector + BM25)."""
         if self._embeddings is None or len(self._embeddings) == 0:
             return []
 
+        # Vector search
         q_vec = self._embed([text])[0]
-        sims = _cosine_similarity(q_vec, self._embeddings)
+        vec_sims = _cosine_similarity(q_vec, self._embeddings)
+        
+        # BM25 keyword search
+        bm25_scores = self._bm25.score(text)
+        if len(bm25_scores) > 0 and bm25_scores.max() > 0:
+            # Normalize BM25 scores to [0, 1]
+            bm25_sims = bm25_scores / bm25_scores.max()
+        else:
+            bm25_sims = np.zeros_like(vec_sims)
+            
+        # Combine scores
+        sims = (hybrid_alpha * vec_sims) + ((1 - hybrid_alpha) * bm25_sims)
 
         # Boost code files over doc files to avoid README dominating results
         boosts = np.ones(len(sims), dtype=np.float32)
@@ -315,6 +437,8 @@ class VectorStore:
         self._embeddings = None
         self._metadata = []
         self._ids = []
+        self._texts = []
+        self._bm25 = BM25()
         self._save()
 
     @staticmethod

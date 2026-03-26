@@ -114,10 +114,15 @@ def _get_llm_config(model: str | None = None) -> tuple[str, str, str, bool]:
     return "", "", "", False
 
 
-def _call_llm(prompt: str, model: str | None = None, _system_override: str | None = None) -> str:
+def _call_llm(prompt: str, model: str | None = None, _system_override: str | None = None, history: list[dict] | None = None) -> str:
     """Non-streaming LLM call (used as fallback)."""
     api_key, base_url, llm_model, thinking = _get_llm_config(model)
     system_msg = _system_override or SYSTEM_PROMPT
+    messages = [{"role": "system", "content": system_msg}]
+    if history:
+        # 仅保留最近的 10 条消息（5轮对话）以避免上下文超限
+        messages.extend(history[-10:])
+    messages.append({"role": "user", "content": prompt})
 
     if not api_key:
         return ""
@@ -130,10 +135,7 @@ def _call_llm(prompt: str, model: str | None = None, _system_override: str | Non
                 f"{base_url}/api/chat",
                 json={
                     "model": llm_model,
-                    "messages": [
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": prompt},
-                    ],
+                    "messages": messages,
                     "stream": False,
                 },
                 timeout=120,
@@ -150,10 +152,7 @@ def _call_llm(prompt: str, model: str | None = None, _system_override: str | Non
         client = openai.OpenAI(api_key=api_key, base_url=base_url)
         resp = client.chat.completions.create(
             model=llm_model,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt},
-            ],
+            messages=messages,
             temperature=0.1,
             max_tokens=4096,
             extra_body={"enable_thinking": thinking} if thinking else {},
@@ -170,6 +169,7 @@ def stream_llm(
     model: str | None = None,
     on_think: Callable[[str], None] | None = None,
     on_answer: Callable[[str], None] | None = None,
+    history: list[dict] | None = None,
 ) -> str:
     """
     Streaming LLM call with thinking/reasoning support.
@@ -179,9 +179,15 @@ def stream_llm(
     """
     api_key, base_url, llm_model, thinking = _get_llm_config(model)
 
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if history:
+        # 仅保留最近的 10 条消息（5轮对话）以避免上下文超限
+        messages.extend(history[-10:])
+    messages.append({"role": "user", "content": prompt})
+
     if not api_key:
         # Fallback to non-streaming
-        answer = _call_llm(prompt, model=model)
+        answer = _call_llm(prompt, model=model, history=history)
         if answer and on_answer:
             on_answer(answer)
         return answer
@@ -196,10 +202,7 @@ def stream_llm(
                 f"{base_url}/api/chat",
                 json={
                     "model": llm_model,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
+                    "messages": messages,
                     "stream": True,
                 },
                 timeout=120,
@@ -224,36 +227,33 @@ def stream_llm(
         import openai
         client = openai.OpenAI(api_key=api_key, base_url=base_url)
         stream = client.chat.completions.create(
-                model=llm_model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.1,
-                max_tokens=4096,
-                stream=True,
-                extra_body={"enable_thinking": thinking} if thinking else {},
-            )
-            answer_parts: list[str] = []
-            is_answering = False
-            for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta is None:
-                    continue
-                # Reasoning / thinking tokens
-                if hasattr(delta, "reasoning_content") and delta.reasoning_content:
-                    if on_think:
-                        on_think(delta.reasoning_content)
-                # Answer tokens
-                if delta.content:
-                    if not is_answering:
-                        is_answering = True
-                    answer_parts.append(delta.content)
-                    if on_answer:
-                        on_answer(delta.content)
-            return "".join(answer_parts)
-        except Exception as e:
-            print(f"\n[LLM Error] {type(e).__name__}: {e}", file=sys.stderr)
+            model=llm_model,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=4096,
+            stream=True,
+            extra_body={"enable_thinking": thinking} if thinking else {},
+        )
+        answer_parts: list[str] = []
+        is_answering = False
+        for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta is None:
+                continue
+            # Reasoning / thinking tokens
+            if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                if on_think:
+                    on_think(delta.reasoning_content)
+            # Answer tokens
+            if delta.content:
+                if not is_answering:
+                    is_answering = True
+                answer_parts.append(delta.content)
+                if on_answer:
+                    on_answer(delta.content)
+        return "".join(answer_parts)
+    except Exception as e:
+        print(f"\n[LLM Error] {type(e).__name__}: {e}", file=sys.stderr)
 
     # Fallback: non-streaming
     answer = _call_llm(prompt, model=model)
@@ -267,6 +267,7 @@ def answer_question(
     question: str,
     n_context: int = 5,
     model: str | None = None,
+    history: list[dict] | None = None,
 ) -> dict:
     """
     Answer a question (non-streaming).
@@ -287,7 +288,7 @@ def answer_question(
 
     context = _format_context(results)
     prompt = _build_prompt(context, question)
-    answer = _call_llm(prompt, model=model)
+    answer = _call_llm(prompt, model=model, history=history)
 
     if not answer:
         answer = (
@@ -306,6 +307,7 @@ def answer_question_stream(
     model: str | None = None,
     on_think: Callable[[str], None] | None = None,
     on_answer: Callable[[str], None] | None = None,
+    history: list[dict] | None = None,
 ) -> dict:
     """
     Answer a question with streaming output.
@@ -322,7 +324,7 @@ def answer_question_stream(
 
     context = _format_context(results)
     prompt = _build_prompt(context, question)
-    answer = stream_llm(prompt, model=model, on_think=on_think, on_answer=on_answer)
+    answer = stream_llm(prompt, model=model, on_think=on_think, on_answer=on_answer, history=history)
 
     if not answer:
         fallback = (

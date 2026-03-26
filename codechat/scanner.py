@@ -11,12 +11,23 @@ from .config import CODE_EXTENSIONS, DOC_EXTENSIONS, CONFIG_EXTENSIONS, MAX_FILE
 ALL_EXTENSIONS = CODE_EXTENSIONS | DOC_EXTENSIONS | CONFIG_EXTENSIONS
 
 
-def _load_gitignore(project_root: Path) -> pathspec.PathSpec | None:
-    """Load .gitignore patterns if available."""
+def _load_ignore_patterns(project_root: Path) -> pathspec.PathSpec | None:
+    """Load .gitignore and .codechatignore patterns if available."""
+    lines = []
+    
     gitignore = project_root / ".gitignore"
     if gitignore.exists():
-        lines = gitignore.read_text(encoding="utf-8", errors="ignore").splitlines()
-        return pathspec.PathSpec.from_lines("gitwildmatch", lines)
+        lines.extend(gitignore.read_text(encoding="utf-8", errors="ignore").splitlines())
+        
+    codechatignore = project_root / ".codechatignore"
+    if codechatignore.exists():
+        lines.extend(codechatignore.read_text(encoding="utf-8", errors="ignore").splitlines())
+        
+    # Clean up lines
+    valid_lines = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
+        
+    if valid_lines:
+        return pathspec.PathSpec.from_lines("gitignore", valid_lines)
     return None
 
 
@@ -38,7 +49,7 @@ def scan_files(project_root: Path, extra_extensions: set[str] | None = None) -> 
     Respects .gitignore, skips binary/build directories.
     """
     project_root = project_root.resolve()
-    gitignore = _load_gitignore(project_root)
+    ignore_patterns = _load_ignore_patterns(project_root)
     extensions = ALL_EXTENSIONS | (extra_extensions or set())
 
     files: list[Path] = []
@@ -56,8 +67,8 @@ def scan_files(project_root: Path, extra_extensions: set[str] | None = None) -> 
             fpath = Path(dirpath) / fname
             rel = rel_dir / fname
 
-            # Check gitignore
-            if gitignore and gitignore.match_file(str(rel)):
+            # Check ignore patterns
+            if ignore_patterns and ignore_patterns.match_file(str(rel)):
                 continue
 
             # Check extension

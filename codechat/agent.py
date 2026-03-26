@@ -348,12 +348,17 @@ class ShortTermMemory:
             # Keep first (goal) and last N
             self.entries = [self.entries[0]] + self.entries[-(self.max_entries - 1):]
 
-    def get_context(self, max_chars: int = 6000) -> str:
-        """Format memory into a string for the LLM."""
+    def get_context(self, max_chars: int = 8000) -> str:
+        """Format memory into a string for the LLM, strictly bound by max_chars."""
         lines = []
         total = 0
         for entry in reversed(self.entries):
-            line = f"[{entry.role}] {entry.content}"
+            # Truncate overly long single tool outputs to prevent token overflow
+            content_str = entry.content
+            if entry.role == "tool" and len(content_str) > 2000:
+                content_str = content_str[:2000] + "\n...[truncated for length]..."
+                
+            line = f"[{entry.role}] {content_str}"
             if total + len(line) > max_chars:
                 break
             lines.append(line)
