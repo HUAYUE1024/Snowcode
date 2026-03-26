@@ -16,6 +16,26 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# Global stderr filter: suppress HuggingFace/transformers LOAD REPORT noise
+_orig_stderr = sys.stderr
+_FILTER_KEYS = (
+    "LOAD REPORT", "UNEXPECTED", "Notes:", "embeddings.position",
+    "bert.embeddings.position", "--------+", "Key", "Status",
+)
+
+
+class _GlobalStderrFilter:
+    """Filter stderr to suppress model loading noise from C extensions."""
+    def write(self, text):
+        if any(k in text for k in _FILTER_KEYS):
+            return
+        _orig_stderr.write(text)
+    def flush(self):
+        _orig_stderr.flush()
+
+
+sys.stderr = _GlobalStderrFilter()
+
 import click
 import json
 from rich.console import Console
