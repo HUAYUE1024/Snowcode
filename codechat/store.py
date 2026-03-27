@@ -89,22 +89,30 @@ def _load_hf_model(model_name: str, model_class, use_hf_mirror: bool = True):
         warnings.filterwarnings("ignore", message=".*UNEXPECTED.*")
         warnings.filterwarnings("ignore", message=".*unauthenticated requests.*")
         
-        # OS-level stderr redirect to catch C extension output
-        import tempfile as _tempfile
-        _orig_fd = os.dup(2)
-        _tmp = _tempfile.TemporaryFile()
-        os.dup2(_tmp.fileno(), 2)
+        # Suppress transformers logging
+        import logging
+        logging.getLogger("transformers").setLevel(logging.CRITICAL)
+        logging.getLogger("sentence_transformers").setLevel(logging.CRITICAL)
+        os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+        
+        # Python-level stderr filter (catches most output; C extensions may bypass)
+        _orig_stderr = sys.stderr
+        _filter_keys = ("LOAD REPORT", "UNEXPECTED", "Notes:", "embeddings.position",
+                        "bert.embeddings.position", "--------+", "Key", "Status")
+        
+        class _ModelStderrFilter:
+            def write(self, text):
+                if any(k in text for k in _filter_keys):
+                    return
+                _orig_stderr.write(text)
+            def flush(self):
+                _orig_stderr.flush()
+        
+        sys.stderr = _ModelStderrFilter()
         try:
             model = model_class(model_name)
         finally:
-            os.dup2(_orig_fd, 2)
-            os.close(_orig_fd)
-            # Dump non-noise lines from temp file
-            _tmp.seek(0)
-            for _line in _tmp:
-                if not any(k in _line for k in (b"LOAD REPORT", b"UNEXPECTED", b"Notes:", b"embeddings.position", b"bert.embeddings.position", b"--------+")):
-                    os.write(2, _line)
-            _tmp.close()
+            sys.stderr = _orig_stderr
     
         # Restore original SSL env vars
         for k in _ssl_vars:
