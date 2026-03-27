@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -16,46 +15,6 @@ if sys.platform == "win32":
         sys.stderr.reconfigure(encoding="utf-8")
     except Exception:
         pass
-
-# Suppress HuggingFace/transformers LOAD REPORT noise from C extensions.
-# These bypass Python sys.stderr and write directly to OS fd 2.
-# We redirect fd 2 to a temp file, then restore it after imports.
-_FILTER_KEYS = (b"LOAD REPORT", b"UNEXPECTED", b"Notes:", b"embeddings.position",
-                b"bert.embeddings.position", b"--------+")
-_orig_stderr_fd = None
-_tmp_file = None
-
-
-def _suppress_c_stderr_start():
-    """Redirect OS-level stderr fd to a temp file to suppress C-level noise."""
-    global _orig_stderr_fd, _tmp_file
-    try:
-        _orig_stderr_fd = os.dup(2)
-        _tmp_file = tempfile.TemporaryFile(mode="w+b")
-        os.dup2(_tmp_file.fileno(), 2)
-    except Exception:
-        pass
-
-
-def _suppress_c_stderr_end():
-    """Restore original stderr and dump non-filtered lines."""
-    global _orig_stderr_fd, _tmp_file
-    try:
-        if _orig_stderr_fd is not None:
-            os.dup2(_orig_stderr_fd, 2)
-            os.close(_orig_stderr_fd)
-        if _tmp_file is not None:
-            _tmp_file.seek(0)
-            for line in _tmp_file:
-                if not any(k in line for k in _FILTER_KEYS):
-                    os.write(2, line)
-            _tmp_file.close()
-    except Exception:
-        pass
-
-
-# Start suppressing before any heavy imports
-_suppress_c_stderr_start()
 
 import click
 import json
@@ -69,8 +28,6 @@ from rich.syntax import Syntax
 
 from . import __version__
 
-# Restore stderr after imports
-_suppress_c_stderr_end()
 from .chunker import chunk_file
 from .config import get_codechat_dir, load_config, save_config, DEFAULT_EMBEDDING_MODEL
 from .rag import answer_question, answer_question_stream, _get_llm_config
