@@ -26,7 +26,7 @@
 | **Hybrid Retrieval** | Dense (vector) + Sparse (BM25) + Cross-encoder reranking |
 | **AST-Aware Chunking** | Tree-sitter parsing for 20+ languages, preserving semantic boundaries |
 | **ReAct Agent** | Planning → Tools → Memory → Observation loop with repeat detection |
-| **8 Tool Suite** | Full CRUD: search, read, write, search-replace, delete, list, find-pattern, read-multiple |
+| **11 Tool Suite** | Full CRUD + Shell + Git + Python execution |
 | **Incremental Indexing** | File hash tracking; only changed files re-processed |
 | **Multi-LLM Backend** | DashScope / OpenAI-compatible / Ollama with streaming + thinking mode |
 | **Privacy Guarantee** | Zero data exfiltration; all computation local except optional LLM API |
@@ -131,18 +131,21 @@ The agent follows the **ReAct** (Reasoning + Acting) paradigm:
 - Short-term: Sliding window (20 entries, 30K chars) of tool calls and observations within a session.
 - Long-term: Q&A sessions persisted to `.codechat/memory.jsonl` for cross-session recall.
 
-**Tool Suite** (8 tools, full CRUD):
+**Tool Suite** (11 tools):
 
-| Tool | Class | Operation | Safety |
-|:-----|:------|:----------|:-------|
-| `search` | SearchTool | Semantic search | Read-only |
-| `read_file` | ReadFileTool | Read full file (≤2000 lines) | Path validated |
-| `find_pattern` | FindPatternTool | Regex search (≤200 char pattern, ≤500 char lines) | ReDoS protected |
-| `list_dir` | ListDirTool | Browse directory | Skip dirs applied |
-| `read_multiple` | ReadMultipleTool | Batch file reads | Path validated |
-| `write_file` | WriteFileTool | Create/overwrite file | `.bak` backup |
-| `search_replace` | SearchReplaceTool | Find-and-replace code blocks | `.bak` backup |
-| `delete_file` | DeleteFileTool | Delete file | `.deleted` backup |
+| Tool | Operation | Description | Safety |
+|:-----|:----------|:------------|:-------|
+| `search` | Search | Semantic code search | Read-only |
+| `read_file` | Read | Read full file (≤2000 lines) | Path validated |
+| `find_pattern` | Search | Regex search (≤200 char pattern) | ReDoS protected |
+| `list_dir` | Browse | Directory structure | Skip dirs |
+| `read_multiple` | Read | Batch file reads | Path validated |
+| `write_file` | Create/Update | Write/overwrite file | `.bak` backup |
+| `search_replace` | Update | Find-and-replace code | `.bak` backup |
+| `delete_file` | Delete | Delete file | `.deleted` backup |
+| `shell` | Execute | Run terminal commands (cmd/bash) | Dangerous cmds blocked |
+| `git` | Execute | Git operations (status/log/diff/blame) | Whitelisted only |
+| `python_run` | Execute | Run Python snippets | Dangerous code blocked |
 
 **Safety Mechanisms**:
 - Path traversal prevention: `resolve()` + `is_relative_to(root)` on all file operations
@@ -268,7 +271,7 @@ All project data stored in `.codechat/`:
 | Total Python LOC | ~4,400 |
 | Modules | 11 |
 | CLI Commands | 16 |
-| Agent Tools | 8 |
+| Agent Tools | 11 |
 | Skills | 7 |
 | Supported Languages | 20+ (AST) / 40+ (regex) |
 
