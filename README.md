@@ -2,303 +2,277 @@
 
 # codechat
 
-**Local RAG codebase Q&A engine — chat with your code in the terminal**
+**A Local RAG-Powered Code Intelligence Engine for Terminal Environments**
 
-[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://python.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-0DA338.svg)](LICENSE)
+[![Architecture](https://img.shields.io/badge/Architecture-ReAct_Agent-blueviolet.svg)](#agent-architecture)
 [![Privacy](https://img.shields.io/badge/Privacy-100%25_Local-red.svg)](#privacy--security)
+
+*A Retrieval-Augmented Generation system designed for codebase comprehension, featuring AST-aware semantic chunking, hybrid vector-keyword retrieval, and an autonomous ReAct agent with full CRUD tool capabilities.*
 
 </div>
 
 ---
 
-Take over a complex project or revisit your old codebase — understanding the architecture shouldn't take days. **codechat** vectorizes your project locally so you can "talk" to your code from the terminal.
+## Abstract
 
-## Quick Start
+**codechat** is a privacy-first, fully-local code intelligence engine that enables developers to query, analyze, and modify codebases through natural language in a terminal environment. Unlike cloud-based alternatives (GitHub Copilot, Cursor), codechat performs all embedding, indexing, and retrieval operations locally, with only optional LLM calls leaving the machine. The system employs a hybrid retrieval architecture combining dense vector similarity (sentence-transformers) with sparse keyword matching (BM25), reranked by a cross-encoder, and orchestrated through a ReAct agent with planning, memory, and 8 specialized tools supporting full CRUD operations.
+
+## Key Contributions
+
+| Contribution | Description |
+|:-------------|:------------|
+| **Hybrid Retrieval** | Dense (vector) + Sparse (BM25) + Cross-encoder reranking |
+| **AST-Aware Chunking** | Tree-sitter parsing for 20+ languages, preserving semantic boundaries |
+| **ReAct Agent** | Planning → Tools → Memory → Observation loop with repeat detection |
+| **8 Tool Suite** | Full CRUD: search, read, write, search-replace, delete, list, find-pattern, read-multiple |
+| **Incremental Indexing** | File hash tracking; only changed files re-processed |
+| **Multi-LLM Backend** | DashScope / OpenAI-compatible / Ollama with streaming + thinking mode |
+| **Privacy Guarantee** | Zero data exfiltration; all computation local except optional LLM API |
+
+---
+
+## System Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                         Terminal Interface                           │
+│                    (Click CLI + Rich + Prompt Toolkit)               │
+├─────────────┬────────────────────────┬───────────────────────────────┤
+│   Direct    │    Agent Mode          │    Skill Mode                 │
+│   Query     │                        │                               │
+│             │ ┌──────────────────┐   │ explain / review / find       │
+│   ask       │ │    Planner       │   │ summary / trace / compare     │
+│   chat      │ │  (LLM-decomposed │   │ test-suggest / tree           │
+│             │ │   sub-tasks)     │   │                               │
+│             │ ├──────────────────┤   │ (7 specialized prompts with   │
+│             │ │    Executor      │   │  optimized retrieval params)  │
+│             │ │  (8 tools, retry │   │                               │
+│             │ │   + dedup)       │   │                               │
+│             │ ├──────────────────┤   │                               │
+│             │ │    Memory        │   │                               │
+│             │ │ Short: sliding   │   │                               │
+│             │ │ Long: .jsonl     │   │                               │
+│             │ └──────────────────┘   │                               │
+├─────────────┴────────────────────────┴───────────────────────────────┤
+│                      RAG Retrieval Engine                            │
+│  ┌──────────────┐   ┌──────────────────────────────────────────┐    │
+│  │  Query       │──▶│  Hybrid Search                           │    │
+│  │  Embedding   │   │  ┌──────────┐  ┌──────┐  ┌───────────┐  │    │
+│  │  (mpnet-768) │   │  │  Vector  │  │ BM25 │  │ Cross-    │  │    │
+│  │              │   │  │  Search  │+ │      │─▶│ Encoder   │  │    │
+│  │              │   │  │  (cosine)│  │(tfidf│  │ Reranker  │  │    │
+│  │              │   │  └──────────┘  └──────┘  └───────────┘  │    │
+│  └──────────────┘   └──────────────────────────────────────────┘    │
+├──────────────────────────────────────────────────────────────────────┤
+│                       Indexing Pipeline                              │
+│                                                                      │
+│  ┌──────────┐   ┌────────────┐   ┌──────────┐   ┌───────────────┐  │
+│  │ Scanner  │──▶│  Chunker   │──▶│ Embedder │──▶│  VectorStore  │  │
+│  │          │   │            │   │          │   │               │  │
+│  │ os.walk  │   │ AST-first  │   │ mpnet    │   │ .npy + JSON   │  │
+│  │ pruning  │   │ → regex    │   │ 768-dim  │   │ + BM25 index  │  │
+│  │ + gitign │   │ → lines    │   │ local    │   │ + file hashes │  │
+│  │ + codech │   │ (20+ lang) │   │          │   │               │  │
+│  └──────────┘   └────────────┘   └──────────┘   └───────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+## Methodology
+
+### 1. Code-Aware Indexing Pipeline
+
+**File Discovery** (`scanner.py`): Recursively traverses the project using `os.walk` with in-place directory pruning. Respects both `.gitignore` and `.codechatignore` patterns via the `pathspec` library. Skips 14 categories of non-source directories (`.git`, `node_modules`, `__pycache__`, `.venv`, etc.) and enforces a 1MB file size limit.
+
+**Semantic Chunking** (`chunker.py`, `ast_chunker.py`): Employs a three-tier fallback strategy:
+
+1. **AST Parsing** (Tree-sitter): Parses source into syntax trees for 20+ languages. Extracts top-level definitions (functions, classes, methods, interfaces, traits) as atomic chunks. Merges fragments shorter than 10 lines with adjacent chunks.
+
+2. **Regex Heuristics**: Pattern-based detection of function/class boundaries using language-specific regular expressions (Python `def`/`class`, Go `func`, Rust `fn`/`impl`, etc.).
+
+3. **Line-Based Sliding Window**: Overlapping window (default 1500 chars, 5-line overlap) as final fallback.
+
+**Vector Storage** (`store.py`): Embeds chunks using `all-mpnet-base-v2` (768-dimensional) via sentence-transformers. Stores embeddings as NumPy `.npy` matrices and metadata as JSON, avoiding external database dependencies. Supports incremental indexing via content-based file hashing (mtime + size).
+
+### 2. Hybrid Retrieval
+
+The retrieval engine combines two complementary search strategies:
+
+**Dense Retrieval**: Query embedding (mpnet-768) compared against stored chunk embeddings via cosine similarity. File-type weighting applied post-retrieval: code files ×1.0, documents ×0.4, config files ×0.7. Diversification ensures no more than 2 chunks per file in results.
+
+**Sparse Retrieval (BM25)**: Token-based keyword matching using BM25 scoring with IDF weighting. Effective for exact term matching (function names, variable names, error messages).
+
+**Cross-Encoder Reranking**: Top candidates from both methods reranked using `cross-encoder/ms-marco-MiniLM-L-6-v2` for final relevance ordering.
+
+### 3. Agent Architecture
+
+The agent follows the **ReAct** (Reasoning + Acting) paradigm:
+
+```
+┌─────────────────────────────────────────────────┐
+│                   ReAct Loop                    │
+│                                                 │
+│  ┌─────────┐    ┌─────────┐    ┌────────────┐  │
+│  │  Think   │───▶│  Act    │───▶│  Observe   │  │
+│  │ (LLM)   │    │ (Tool)  │    │ (Result)   │  │
+│  └─────────┘    └─────────┘    └─────┬──────┘  │
+│       ▲                               │         │
+│       └───────────────────────────────┘         │
+│                                                 │
+│  Termination: answer found | repeat detected    │
+│               max steps    | no results ×3      │
+└─────────────────────────────────────────────────┘
+```
+
+**Planning**: LLM decomposes user goals into 2-5 executable steps with tool hints.
+
+**Memory**: 
+- Short-term: Sliding window (20 entries, 30K chars) of tool calls and observations within a session.
+- Long-term: Q&A sessions persisted to `.codechat/memory.jsonl` for cross-session recall.
+
+**Tool Suite** (8 tools, full CRUD):
+
+| Tool | Class | Operation | Safety |
+|:-----|:------|:----------|:-------|
+| `search` | SearchTool | Semantic search | Read-only |
+| `read_file` | ReadFileTool | Read full file (≤2000 lines) | Path validated |
+| `find_pattern` | FindPatternTool | Regex search (≤200 char pattern, ≤500 char lines) | ReDoS protected |
+| `list_dir` | ListDirTool | Browse directory | Skip dirs applied |
+| `read_multiple` | ReadMultipleTool | Batch file reads | Path validated |
+| `write_file` | WriteFileTool | Create/overwrite file | `.bak` backup |
+| `search_replace` | SearchReplaceTool | Find-and-replace code blocks | `.bak` backup |
+| `delete_file` | DeleteFileTool | Delete file | `.deleted` backup |
+
+**Safety Mechanisms**:
+- Path traversal prevention: `resolve()` + `is_relative_to(root)` on all file operations
+- ReDoS protection: Pattern length ≤200 chars, search line ≤500 chars
+- Repeat detection: Auto-exits if identical tool+params called 2× consecutively
+- Hard step cap: 50 steps maximum (configurable via `--steps`)
+- All destructive operations create backups before execution
+
+### 4. Multi-LLM Backend
+
+| Backend | Environment Variables | Features |
+|:--------|:--------------------|:---------|
+| **DashScope** | `DASHSCOPE_API_KEY` | Streaming, thinking/reasoning tokens |
+| **OpenAI Compat** | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | Any OpenAI-compatible API |
+| **Ollama** | `OLLAMA_URL`, `OLLAMA_MODEL` | Fully local, zero network |
+
+Default: `qwen-flash` via DashScope. Thinking mode (reasoning tokens) off by default, enabled via `CODECHAT_THINKING=1`.
+
+---
+
+## Commands Reference
+
+### Core
+
+| Command | Description | Example |
+|:--------|:------------|:--------|
+| `ingest` | Build vector index (incremental) | `codechat ingest --reset` |
+| `ask` | Direct Q&A with streaming | `codechat ask "how does auth work?"` |
+| `chat` | Interactive REPL with persistent memory | `codechat chat` |
+| `status` | Index statistics | `codechat status` |
+| `clean` | Delete index | `codechat clean` |
+
+### Agent
+
+| Command | Description | Example |
+|:--------|:------------|:--------|
+| `agent` | Multi-step autonomous exploration | `codechat agent "trace request lifecycle"` |
+
+Options: `-s N` max steps, `--no-plan` skip planning, `-m MODEL` LLM
+
+### Skills (Specialized Prompts)
+
+| Command | Purpose | Optimal Use Case |
+|:--------|:--------|:-----------------|
+| `explain` | Function/class/file explanation | Onboarding to unfamiliar code |
+| `review` | Bug/security/performance audit | Pre-commit quality gate |
+| `find` | Pattern search (regex, definitions) | Locating specific logic |
+| `summary` | Architecture overview | Project documentation |
+| `trace` | Call chain tracing | Debugging, impact analysis |
+| `compare` | File diff with analysis | Refactoring, merge review |
+| `test-suggest` | Test case generation | Test planning |
+| `tree` | Visual project structure | Quick orientation |
+
+---
+
+## Installation
 
 ```bash
 git clone https://github.com/HUAYUE1024/codechat.git
 cd codechat
 pip install -e .
-
-cd /path/to/your-project
-codechat ingest                              # build vector index
-codechat ask "how does auth work?"           # ask questions
-codechat agent "trace the request lifecycle" # multi-step exploration
-codechat chat                                # interactive REPL
-```
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `ingest` | Scan project, build vector index (incremental by default) |
-| `ask "question"` | Ask about the codebase (streaming + LLM thinking) |
-| `agent "question"` | Multi-step agent: Plan → Tools → Memory → Answer |
-| `chat` | Interactive REPL with history and auto-complete |
-| `explain "target"` | Explain a function, class, or file |
-| `review` | Code review: bugs, security, performance |
-| `find "pattern"` | Search code patterns (regex, definitions, imports) |
-| `summary` | Generate project architecture overview |
-| `trace "target"` | Trace function call chains |
-| `compare A B` | Compare two files or modules |
-| `test-suggest "target"` | Suggest test cases |
-| `status` | Show index status |
-| `clean` | Delete the vector index |
-
-**Common options:** `-p PATH` project path, `-m MODEL` LLM model, `--show-sources` show source files
-
-## Setup LLM
-
-```cmd
-:: Windows
-set DASHSCOPE_API_KEY=sk-xxx
-
-# Linux / Mac
-export DASHSCOPE_API_KEY=sk-xxx
-```
-
-Default model: `qwen-flash`. See [LLM Config](#llm-config) for more options.
-
-## Agent Mode
-
-Multi-step agent with Planning, Tools, Memory, and Action.
-
-```bash
-codechat agent "how does the vector store persist data?"
-codechat agent "question" -s 10       # limit to 10 steps
-codechat agent "question" --no-plan   # skip planning
-```
-
-### Agent Tools (8 total — full CRUD)
-
-| Tool | Operation | Description |
-|------|-----------|-------------|
-| `search` | Search | Semantic code search |
-| `read_file` | **Read** | Read full file content (up to 2000 lines) |
-| `find_pattern` | Search | Regex search across codebase |
-| `list_dir` | Browse | Directory structure |
-| `read_multiple` | Read | Read multiple files simultaneously |
-| `write_file` | **Create/Update** | Write or overwrite file (auto .bak backup) |
-| `search_replace` | **Update** | Find and replace specific code blocks |
-| `delete_file` | **Delete** | Delete file (auto .deleted backup) |
-
-All write/delete operations create backups before modifying.
-
-### Agent Memory
-
-- **Short-term**: Sliding window of tool calls (default 20 entries, 30K chars)
-- **Long-term**: Q&A sessions persisted to `.codechat/memory.jsonl`
-- **Repeat detection**: Auto-exits if same tool+params called repeatedly
-
-### Agent Safety
-
-- File operations restricted to project root (no path traversal)
-- Regex patterns limited to prevent ReDoS
-- Hard cap at 50 steps (override with `--steps`)
-- All writes create `.bak` backups, deletes create `.deleted` backups
-
-## Incremental Indexing
-
-By default, `ingest` only processes changed files:
-
-```bash
-codechat ingest          # incremental: new/changed/deleted files only
-codechat ingest --reset  # full rebuild
-```
-
-How it works:
-1. File hashes (mtime + size) stored in `.codechat/file_hashes.json`
-2. On subsequent runs, only changed/new files re-chunked and re-embedded
-3. Chunks from deleted files automatically removed
-
-## AST-Aware Chunking
-
-Code is split using Tree-sitter AST parsing first, with regex and line-based fallback.
-
-**Strategy:** AST (Tree-sitter) → regex function splitter → line-based
-
-**Supported languages:** Python, JS/TS, Go, Rust, Java, C/C++, Ruby, PHP, C#, Kotlin, Swift, Lua, Bash, SQL, R, HTML, CSS — 20+ languages
-
-## Skills
-
-7 specialized prompts for specific analysis tasks:
-
-| Command | Purpose |
-|---------|---------|
-| `explain` | Explain function/class/file |
-| `review` | Code review (bugs, security, performance) |
-| `find` | Search patterns (regex, definitions) |
-| `summary` | Architecture overview |
-| `trace` | Call chain tracing |
-| `compare` | Compare two files |
-| `test-suggest` | Test case suggestions |
-
-## LLM Config
-
-### DashScope (Recommended for China)
-
-```cmd
-set DASHSCOPE_API_KEY=sk-xxx
-```
-
-Default model: `qwen-flash`
-
-### OpenAI Compatible
-
-```cmd
-set OPENAI_API_KEY=sk-xxx
-set OPENAI_BASE_URL=https://api.openai.com/v1
-```
-
-### Ollama (Local)
-
-```cmd
-ollama pull qwen2.5-coder:7b
-set OLLAMA_URL=http://localhost:11434
-set OLLAMA_MODEL=qwen2.5-coder
-```
-
-### Thinking Mode
-
-DashScope reasoning tokens, off by default:
-
-```cmd
-set CODECHAT_THINKING=1
-codechat ask "complex question" --show-thinking
-```
-
-### Embedding Models
-
-```bash
-codechat ingest -m all-mpnet-base-v2           # default, best quality
-codechat ingest -m all-MiniLM-L6-v2            # faster, lower quality
-codechat ingest -m paraphrase-multilingual-MiniLM-L12-v2  # multilingual
-```
-
-| Model | Dimensions | Size |
-|-------|-----------|------|
-| `all-mpnet-base-v2` | 768 | 420MB |
-| `all-MiniLM-L6-v2` | 384 | 90MB |
-| `paraphrase-multilingual-MiniLM-L12-v2` | 384 | 470MB |
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────┐
-│                   CLI (Click + Rich)                 │
-├──────────┬────────────────┬──────────────────────────┤
-│   ask    │    agent       │   skills                 │
-│          │                │ explain/review/find      │
-│          │ ┌────────────┐ │ summary/trace/           │
-│          │ │ Planning   │ │ compare/test-suggest     │
-│          │ │ Memory     │ │                          │
-│          │ │ Action     │ │                          │
-│          │ │ 8 Tools    │ │                          │
-│          │ └────────────┘ │                          │
-├──────────┴────────────────┴──────────────────────────┤
-│                   RAG Engine                         │
-├──────────────────────────────────────────────────────┤
-│ Scanner → Chunker → VectorStore → LLM Client        │
-│ (os.walk   (AST-first  (NumPy .npy  (DashScope     │
-│  pruning)   + regex     + JSON +     OpenAI         │
-│            fallback)    BM25 hybrid) Ollama)        │
-└──────────────────────────────────────────────────────┘
-```
-
-## Project Structure
-
-```
-codechat/           ~4300 lines Python
-├── cli.py          CLI commands (804 lines)
-├── agent.py        Agent: Planning/Tools/Memory/Action (1129 lines)
-├── store.py        Vector store + BM25 hybrid search (701 lines)
-├── rag.py          RAG engine + LLM clients (390 lines)
-├── tree_gen.py     Tree generation (338 lines)
-├── ast_chunker.py  Tree-sitter AST chunking (297 lines)
-├── skills.py       7 specialized skill prompts (239 lines)
-├── chunker.py      Code chunking (260 lines)
-├── scanner.py      File scanner (115 lines)
-├── config.py       Constants and config (87 lines)
-```
-
-**Generated data:**
-```
-your-project/
-├── .codechat/
-│   ├── config.json        # Index config
-│   ├── embeddings.npy     # Vector matrix
-│   ├── metadata.json      # File paths + line numbers
-│   ├── file_hashes.json   # File hashes for incremental indexing
-│   ├── bm25.json          # BM25 index
-│   └── memory.jsonl       # Agent long-term memory
 ```
 
 ### Dependencies
 
-| Package | Purpose |
-|---------|---------|
-| `click` | CLI framework |
-| `numpy` | Vector storage |
-| `sentence-transformers` | Embedding + reranking models |
-| `tree-sitter` / `tree-sitter-languages` | AST parsing |
-| `prompt-toolkit` | Interactive REPL |
-| `rich` | Terminal output |
-| `pathspec` | .gitignore parsing |
-| `openai` | OpenAI-compatible API |
-| `httpx` | Ollama API |
+| Package | Version | Role |
+|:--------|:--------|:-----|
+| `click` | ≥8.1 | CLI framework |
+| `numpy` | ≥1.24 | Vector storage |
+| `sentence-transformers` | ≥3.0 | Embedding + reranking |
+| `tree-sitter` | ≥0.22 | AST parsing |
+| `tree-sitter-languages` | ≥1.10 | Pre-built grammars |
+| `prompt-toolkit` | ≥3.0 | Interactive REPL |
+| `rich` | ≥13.0 | Terminal rendering |
+| `pathspec` | ≥0.12 | .gitignore parsing |
+| `openai` | ≥1.0 | LLM API client |
+| `httpx` | ≥0.27 | Ollama HTTP client |
 
-## Supported File Types
+---
 
-**Code:** `.py` `.js` `.ts` `.tsx` `.go` `.rs` `.java` `.kt` `.c` `.cpp` `.cs` `.rb` `.php` `.swift` `.sh` `.sql` `.proto` — 40+ languages
+## Data Format
 
-**Docs:** `.md` `.rst` `.txt`
+All project data stored in `.codechat/`:
 
-**Config:** `.json` `.yaml` `.toml` `.xml` `.env`
-
-**Auto-skipped:** `.git` `node_modules` `__pycache__` `.venv` `dist` `build` `.codechat`
-
-## FAQ
-
-**Q: Does it work without an LLM?**
-Yes. Falls back to raw code retrieval.
-
-**Q: Chinese support?**
-Full support. Embedding and LLM both handle Chinese/English mixed input.
-
-**Q: How to change models?**
-```bash
-codechat ingest -m all-mpnet-base-v2           # embedding model
-codechat ask "question" -m qwen-plus           # LLM model
-set CODECHAT_MODEL=deepseek-chat               # permanent LLM
+```
+.codechat/
+├── config.json              # Index configuration
+├── embeddings.npy           # Vector matrix (N × 768 float32)
+├── metadata.json            # Chunk metadata (file, lines, index)
+├── file_hashes.json         # File hashes for incremental indexing
+├── bm25.json                # BM25 inverted index
+├── chat_history.json        # Persistent chat memory
+└── memory.jsonl             # Agent long-term memory
 ```
 
-**Q: What if the agent gets stuck in a loop?**
-Repeat detection auto-exits after 2 identical tool calls. Hard cap at 50 steps.
+---
+
+## Supported Languages
+
+**AST-Aware** (Tree-sitter): Python, JavaScript, TypeScript, TSX, Go, Rust, Java, C, C++, Ruby, PHP, C#, Kotlin, Swift, Lua, Bash, SQL, R, HTML, CSS
+
+**Regex Fallback**: 40+ additional languages via pattern matching
+
+**Auto-Skipped**: `.git`, `__pycache__`, `node_modules`, `.venv`, `dist`, `build`, `.codechat`
+
+---
 
 ## Privacy & Security
 
-- All vector data stored locally in `.codechat/`
-- Embedding runs locally via sentence-transformers
-- Only LLM calls go to external API (DashScope/OpenAI/Ollama)
-- File paths validated against project root (no path traversal)
-- Regex patterns limited to prevent ReDoS
-- Write/delete operations create backups
+- **Zero Cloud Dependency**: Embedding, indexing, BM25, and AST parsing all execute locally
+- **LLM Optional**: System operates in retrieval-only mode without any LLM configured
+- **Path Containment**: All file operations validated against project root via `resolve()` + `is_relative_to()`
+- **Input Sanitization**: Regex patterns length-limited, search lines truncated, ReDoS protected
+- **Backup Safety**: All write/delete operations create `.bak`/`.deleted` backups
+- **No Telemetry**: No analytics, no usage tracking, no external calls beyond optional LLM API
 
-## Roadmap
+---
 
-- [x] RAG Q&A with semantic search
-- [x] Agent with Planning + Tools + Memory (8 tools, CRUD)
-- [x] 7 specialized skills
-- [x] Streaming output + thinking mode
-- [x] Long-term memory persistence
-- [x] Incremental indexing (only changed files)
-- [x] AST-aware chunking (Tree-sitter, 20+ languages)
-- [x] BM25 hybrid search + cross-encoder reranking
-- [x] Test suite
-- [x] Multi-turn conversation memory (chat mode, persisted to chat_history.json)
-- [x] `.codechatignore` custom rules (merged with .gitignore)
-- [x] Export Q&A to Markdown (`/export file.md` in chat mode)
+## Project Statistics
+
+| Metric | Value |
+|:-------|:------|
+| Total Python LOC | ~4,400 |
+| Modules | 11 |
+| CLI Commands | 16 |
+| Agent Tools | 8 |
+| Skills | 7 |
+| Supported Languages | 20+ (AST) / 40+ (regex) |
+
+---
 
 ## License
 
