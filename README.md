@@ -2,341 +2,234 @@
 
 # Snowcode
 
-**A Local RAG-Powered Code Intelligence Engine for Terminal Environments**
+**A Local RAG-Powered Code Intelligence Engine with Multimodal Agent**
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://python.org)
+[![Version](https://img.shields.io/badge/Version-0.3.1-blue.svg)](https://github.com/HUAYUE1024/Snowcode)
 [![License: MIT](https://img.shields.io/badge/License-MIT-0DA338.svg)](LICENSE)
-[![Architecture](https://img.shields.io/badge/Architecture-ReAct_Agent-blueviolet.svg)](#agent-architecture)
 [![Privacy](https://img.shields.io/badge/Privacy-100%25_Local-red.svg)](#privacy--security)
 
-*A Retrieval-Augmented Generation system designed for codebase comprehension, featuring AST-aware semantic chunking, hybrid vector-keyword retrieval, and an autonomous ReAct agent with full CRUD tool capabilities.*
+*Query, analyze, and modify codebases through natural language. Features hybrid RAG retrieval, autonomous ReAct agents with planning & memory, and multimodal tools for images, PDFs, and scientific data.*
 
 </div>
 
 ---
 
-## Abstract
+## Features
 
-**Snowcode** is a privacy-first, fully-local code intelligence engine that enables developers to query, analyze, and modify codebases through natural language in a terminal environment. Unlike cloud-based alternatives (GitHub Copilot, Cursor), codechat performs all embedding, indexing, and retrieval operations locally, with only optional LLM calls leaving the machine. The system employs a hybrid retrieval architecture combining dense vector similarity (sentence-transformers) with sparse keyword matching (BM25), reranked by a cross-encoder, and orchestrated through a ReAct agent with planning, memory, and 8 specialized tools supporting full CRUD operations.
-
-## Key Contributions
-
-| Contribution | Description |
-|:-------------|:------------|
+| Feature | Description |
+|:--------|:------------|
 | **Hybrid Retrieval** | Dense (vector) + Sparse (BM25) + Cross-encoder reranking |
-| **AST-Aware Chunking** | Tree-sitter parsing for 20+ languages, preserving semantic boundaries |
-| **ReAct Agent** | Planning → Tools → Memory → Observation loop with repeat detection |
-| **11 Tool Suite** | Full CRUD + Shell + Git + Python execution |
-| **Incremental Indexing** | File hash tracking; only changed files re-processed |
-| **Multi-LLM Backend** | DashScope / OpenAI-compatible / Ollama with streaming + thinking mode |
-| **Privacy Guarantee** | Zero data exfiltration; all computation local except optional LLM API |
+| **Agent v2** | Enhanced ReAct agent with planning, memory, and 12+ tools |
+| **Multi-Agent** | Coordinator-Worker architecture for complex task decomposition |
+| **Multimodal** | Image analysis (OCR + AI), PDF parsing, document reading |
+| **Scientific Data** | NetCDF (.nc) file support for climate/ocean data analysis |
+| **Interactive Chat** | Persistent session with command history (`agent-chat`) |
+| **File Creation** | Agent can write files, generate reports, and modify code |
+| **Multi-LLM** | DashScope / OpenAI-compatible / Ollama backends |
+| **Privacy** | All indexing local; only optional LLM calls leave the machine |
 
 ---
 
-## System Architecture
+## Quick Start
 
+```bash
+# Install
+pip install -e ".[multimodal]"
+
+# Configure (interactive)
+snowcode config
+
+# Index your project
+snowcode ingest
+
+# Ask questions
+snowcode ask "How does authentication work?"
+
+# Agent mode (autonomous)
+snowcode agent2 "Analyze the project architecture"
+
+# Interactive agent session
+snowcode agent-chat
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                         Terminal Interface                           │
-│                    (Click CLI + Rich + Prompt Toolkit)               │
-├─────────────┬────────────────────────┬───────────────────────────────┤
-│   Direct    │    Agent Mode          │    Skill Mode                 │
-│   Query     │                        │                               │
-│             │ ┌──────────────────┐   │ explain / review / find       │
-│   ask       │ │    Planner       │   │ summary / trace / compare     │
-│   chat      │ │  (LLM-decomposed │   │ test-suggest / tree           │
-│             │ │   sub-tasks)     │   │                               │
-│             │ ├──────────────────┤   │ (7 specialized prompts with   │
-│             │ │    Executor      │   │  optimized retrieval params)  │
-│             │ │  (8 tools, retry │   │                               │
-│             │ │   + dedup)       │   │                               │
-│             │ ├──────────────────┤   │                               │
-│             │ │    Memory        │   │                               │
-│             │ │ Short: sliding   │   │                               │
-│             │ │ Long: .jsonl     │   │                               │
-│             │ └──────────────────┘   │                               │
-├─────────────┴────────────────────────┴───────────────────────────────┤
-│                      RAG Retrieval Engine                            │
-│  ┌──────────────┐   ┌──────────────────────────────────────────┐    │
-│  │  Query       │──▶│  Hybrid Search                           │    │
-│  │  Embedding   │   │  ┌──────────┐  ┌──────┐  ┌───────────┐  │    │
-│  │  (mpnet-768) │   │  │  Vector  │  │ BM25 │  │ Cross-    │  │    │
-│  │              │   │  │  Search  │+ │      │─▶│ Encoder   │  │    │
-│  │              │   │  │  (cosine)│  │(tfidf│  │ Reranker  │  │    │
-│  │              │   │  └──────────┘  └──────┘  └───────────┘  │    │
-│  └──────────────┘   └──────────────────────────────────────────┘    │
-├──────────────────────────────────────────────────────────────────────┤
-│                       Indexing Pipeline                              │
-│                                                                      │
-│  ┌──────────┐   ┌────────────┐   ┌──────────┐   ┌───────────────┐  │
-│  │ Scanner  │──▶│  Chunker   │──▶│ Embedder │──▶│  VectorStore  │  │
-│  │          │   │            │   │          │   │               │  │
-│  │ os.walk  │   │ AST-first  │   │ mpnet    │   │ .npy + JSON   │  │
-│  │ pruning  │   │ → regex    │   │ 768-dim  │   │ + BM25 index  │  │
-│  │ + gitign │   │ → lines    │   │ local    │   │ + file hashes │  │
-│  │ + codech │   │ (20+ lang) │   │          │   │               │  │
-│  └──────────┘   └────────────┘   └──────────┘   └───────────────┘  │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-## Methodology
-
-### 1. Code-Aware Indexing Pipeline
-
-**File Discovery** (`scanner.py`): Recursively traverses the project using `os.walk` with in-place directory pruning. Respects both `.gitignore` and `.snowcodeignore` patterns via the `pathspec` library. Skips 14 categories of non-source directories (`.git`, `node_modules`, `__pycache__`, `.venv`, etc.) and enforces a 1MB file size limit.
-
-**Semantic Chunking** (`chunker.py`, `ast_chunker.py`): Employs a three-tier fallback strategy:
-
-1. **AST Parsing** (Tree-sitter): Parses source into syntax trees for 20+ languages. Extracts top-level definitions (functions, classes, methods, interfaces, traits) as atomic chunks. Merges fragments shorter than 10 lines with adjacent chunks.
-
-2. **Regex Heuristics**: Pattern-based detection of function/class boundaries using language-specific regular expressions (Python `def`/`class`, Go `func`, Rust `fn`/`impl`, etc.).
-
-3. **Line-Based Sliding Window**: Overlapping window (default 1500 chars, 5-line overlap) as final fallback.
-
-**Vector Storage** (`store.py`): Embeds chunks using `all-mpnet-base-v2` (768-dimensional) via sentence-transformers. Stores embeddings as NumPy `.npy` matrices and metadata as JSON, avoiding external database dependencies. Supports incremental indexing via content-based file hashing (mtime + size).
-
-### 2. Hybrid Retrieval
-
-The retrieval engine combines two complementary search strategies:
-
-**Dense Retrieval**: Query embedding (mpnet-768) compared against stored chunk embeddings via cosine similarity. File-type weighting applied post-retrieval: code files ×1.0, documents ×0.4, config files ×0.7. Diversification ensures no more than 2 chunks per file in results.
-
-**Sparse Retrieval (BM25)**: Token-based keyword matching using BM25 scoring with IDF weighting. Effective for exact term matching (function names, variable names, error messages).
-
-**Cross-Encoder Reranking**: Top candidates from both methods reranked using `cross-encoder/ms-marco-MiniLM-L-6-v2` for final relevance ordering.
-
-### 3. Agent Architecture
-
-The agent follows the **ReAct** (Reasoning + Acting) paradigm:
-
-```
-┌─────────────────────────────────────────────────┐
-│                   ReAct Loop                    │
-│                                                 │
-│  ┌─────────┐    ┌─────────┐    ┌────────────┐  │
-│  │  Think   │───▶│  Act    │───▶│  Observe   │  │
-│  │ (LLM)   │    │ (Tool)  │    │ (Result)   │  │
-│  └─────────┘    └─────────┘    └─────┬──────┘  │
-│       ▲                               │         │
-│       └───────────────────────────────┘         │
-│                                                 │
-│  Termination: answer found | repeat detected    │
-│               max steps    | no results ×3      │
-└─────────────────────────────────────────────────┘
-```
-
-**Planning**: LLM decomposes user goals into 2-5 executable steps with tool hints.
-
-**Memory**: 
-- Short-term: Sliding window (20 entries, 30K chars) of tool calls and observations within a session.
-- Long-term: Q&A sessions persisted to `.snowcode/memory.jsonl` for cross-session recall.
-
-**Tool Suite** (11 tools):
-
-| Tool | Operation | Description | Safety |
-|:-----|:----------|:------------|:-------|
-| `search` | Search | Semantic code search | Read-only |
-| `read_file` | Read | Read full file (≤2000 lines) | Path validated |
-| `find_pattern` | Search | Regex search (≤200 char pattern) | ReDoS protected |
-| `list_dir` | Browse | Directory structure | Skip dirs |
-| `read_multiple` | Read | Batch file reads | Path validated |
-| `write_file` | Create/Update | Write/overwrite file | `.bak` backup |
-| `search_replace` | Update | Find-and-replace code | `.bak` backup |
-| `delete_file` | Delete | Delete file | `.deleted` backup |
-| `shell` | Execute | Run terminal commands (cmd/bash) | Dangerous cmds blocked |
-| `git` | Execute | Git operations (status/log/diff/blame) | Whitelisted only |
-| `python_run` | Execute | Run Python snippets | Dangerous code blocked |
-
-**Safety Mechanisms**:
-- Path traversal prevention: `resolve()` + `is_relative_to(root)` on all file operations
-- ReDoS protection: Pattern length ≤200 chars, search line ≤500 chars
-- Repeat detection: Auto-exits if identical tool+params called 2× consecutively
-- Hard step cap: 50 steps maximum (configurable via `--steps`)
-- All destructive operations create backups before execution
-
-### 4. Multi-LLM Backend
-
-| Backend | Environment Variables | Features |
-|:--------|:--------------------|:---------|
-| **DashScope** | `DASHSCOPE_API_KEY` | Streaming, thinking/reasoning tokens |
-| **OpenAI Compat** | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | Any OpenAI-compatible API |
-| **Ollama** | `OLLAMA_URL`, `OLLAMA_MODEL` | Fully local, zero network |
-
-Default: `qwen-flash` via DashScope. Thinking mode (reasoning tokens) off by default, enabled via `CODECHAT_THINKING=1`.
 
 ---
 
-## Commands Reference
+## Commands
 
 ### Core
 
-| Command | Description | Example |
-|:--------|:------------|:--------|
-| `ingest` | Build vector index (incremental) | `codechat ingest --reset` |
-| `ask` | Direct Q&A with streaming | `codechat ask "how does auth work?"` |
-| `chat` | Interactive REPL with persistent memory | `codechat chat` |
-| `status` | Index statistics | `codechat status` |
-| `clean` | Delete index | `codechat clean` |
+| Command | Description |
+|:--------|:------------|
+| `ingest` | Build vector index (incremental) |
+| `ask` | Direct Q&A with streaming |
+| `chat` | Interactive REPL with memory |
+| `status` | Index statistics |
+| `clean` | Delete index |
+| `config` | Configure LLM settings |
 
 ### Agent
 
-| Command | Description | Example |
-|:--------|:------------|:--------|
-| `agent` | Multi-step autonomous exploration | `codechat agent "trace request lifecycle"` |
+| Command | Description |
+|:--------|:------------|
+| `agent` | Single-turn autonomous exploration |
+| `agent2` | Enhanced agent with better tools & memory |
+| `agent-chat` | Interactive persistent agent session |
+| `agent-help` | Detailed usage guide |
 
-Options: `-s N` max steps, `--no-plan` skip planning, `-m MODEL` LLM
+**Agent2 Options:**
+- `--multi-agent` — Enable coordinator-worker mode
+- `--workers N` — Number of parallel workers (default: 2)
+- `--steps N` — Max steps per turn (0 = unlimited)
+- `--no-plan` — Skip planning phase
+- `--model MODEL` — Specify LLM model
 
-### Skills (Specialized Prompts)
+### Skills
 
-| Command | Purpose | Optimal Use Case |
-|:--------|:--------|:-----------------|
-| `explain` | Function/class/file explanation | Onboarding to unfamiliar code |
-| `review` | Bug/security/performance audit | Pre-commit quality gate |
-| `find` | Pattern search (regex, definitions) | Locating specific logic |
-| `summary` | Architecture overview | Project documentation |
-| `trace` | Call chain tracing | Debugging, impact analysis |
-| `compare` | File diff with analysis | Refactoring, merge review |
-| `test-suggest` | Test case generation | Test planning |
-| `tree` | Visual project structure | Quick orientation |
+| Command | Purpose |
+|:--------|:--------|
+| `explain` | Explain function/class/file |
+| `review` | Code review (bugs, security, perf) |
+| `find` | Search code patterns (regex) |
+| `summary` | Architecture overview |
+| `trace` | Function call chain tracing |
+| `compare` | Compare two files |
+| `test-suggest` | Suggest test cases |
+| `tree` | Visual project structure & dependency graph |
+
+---
+
+## Agent Architecture
+
+### Agent v2 (Enhanced)
+
+```
+┌─────────────────────────────────────────────────┐
+│                  Agent v2 Loop                   │
+│                                                  │
+│  ┌─────────┐    ┌─────────┐    ┌────────────┐   │
+│  │  Plan    │───▶│  Act    │───▶│  Observe   │   │
+│  │ (LLM)   │    │ (Tool)  │    │ (Result)   │   │
+│  └─────────┘    └─────────┘    └─────┬──────┘   │
+│       ▲                               │          │
+│       └───────────────────────────────┘          │
+│                                                  │
+│  Memory: Short-term (sliding) + Long-term (.jsonl)│
+└──────────────────────────────────────────────────┘
+```
+
+### Multi-Agent Coordinator
+
+```
+┌──────────────┐     ┌──────────┐     ┌──────────┐
+│ Coordinator  │────▶│ Worker 1 │     │ Worker 2 │
+│  (Plan &     │     └────┬─────┘     └────┬─────┘
+│   Delegate)  │          │                │
+└──────────────┘          ▼                ▼
+                   ┌─────────────────────────┐
+                   │   Synthesize Results    │
+                   └─────────────────────────┘
+```
+
+### Tool Suite (12 tools)
+
+| Tool | Type | Description |
+|:-----|:-----|:------------|
+| `search` | Read | Semantic code search |
+| `read_file` | Read | Read full file content |
+| `find_pattern` | Read | Regex pattern search |
+| `list_dir` | Read | Directory structure |
+| `write_file` | Write | Create/overwrite file |
+| `search_replace` | Write | Find-and-replace code |
+| `shell` | Execute | Run terminal commands |
+| `image_reader` | Multimodal | Image OCR + AI analysis |
+| `pdf_reader` | Multimodal | PDF document parsing |
+| `document_reader` | Multimodal | Word/Excel/CSV/TXT reading |
+| `file_browser` | Multimodal | Directory file listing |
+| `nc_reader` | Scientific | NetCDF data analysis |
+
+---
+
+## Multimodal Capabilities
+
+### Image Analysis
+```bash
+# Agent automatically uses image_reader for image files
+snowcode agent2 "Analyze screenshots/ui.png and describe the layout"
+```
+- **OCR**: Extract text from images (requires `pytesseract`)
+- **AI Analysis**: Send image to vision model (e.g., `qwen-vl-plus`) for detailed description
+
+### Document Reading
+- **PDF**: Extract text, metadata, specific pages
+- **Word/Excel/CSV**: Parse structured data
+- **HTML**: Extract readable content
+
+### Scientific Data (NetCDF)
+```bash
+snowcode agent2 "Analyze data/ocean_temp.nc variables and statistics"
+```
+- View dimensions, variables, attributes
+- Extract variable data with slicing
+- Compute statistics (min/max/mean/std/percentiles)
 
 ---
 
 ## Installation
 
 ```bash
-# From the project root directory
+# Basic installation
 pip install -e .
-```
 
-### Optional Dependencies
-
-```bash
-# Multimodal support (images, PDFs, documents, NetCDF)
+# With multimodal support (recommended)
 pip install -e ".[multimodal]"
 
-# Scientific data analysis (NetCDF)
+# With scientific data support
 pip install -e ".[scientific]"
 
-# All optional features
+# All features
 pip install -e ".[multimodal,scientific]"
 ```
+
+### Dependencies
+
+| Package | Role |
+|:--------|:-----|
+| `click` | CLI framework |
+| `numpy` | Vector storage |
+| `sentence-transformers` | Embedding + reranking |
+| `rich` | Terminal rendering |
+| `prompt-toolkit` | Interactive REPL |
+| `openai` | LLM API client |
+| `Pillow` | Image processing |
+| `PyMuPDF` | PDF reading |
 
 ---
 
-## Deployment Guide
+## Configuration
 
-### Prerequisites
-
-- Python 3.10+
-- Git (optional, for project detection)
-- API Key for LLM (DashScope, OpenAI, or Ollama for local)
-
-### Step 1: Clone and Install
+### Environment Variables
 
 ```bash
-# Clone the repository
-git clone https://github.com/HUAYUE1024/codechat.git Snowcode
-cd Snowcode
+# DashScope (default)
+export DASHSCOPE_API_KEY="sk-xxx"
 
-# Install with all features
-pip install -e ".[multimodal,scientific]"
+# OpenAI-compatible
+export OPENAI_API_KEY="sk-xxx"
+export OPENAI_BASE_URL="https://api.openai.com/v1"
 
-# Verify installation
-snowcode --help
+# Ollama (local)
+export OLLAMA_URL="http://localhost:11434"
+export OLLAMA_MODEL="codellama"
 ```
 
-### Step 2: Configure LLM
-
-Set your API key as an environment variable:
-
-```bash
-# Windows (PowerShell)
-$env:DASHSCOPE_API_KEY="your-api-key"
-
-# Linux/Mac
-export DASHSCOPE_API_KEY="your-api-key"
-```
-
-Or use the interactive config command inside any project:
+### Interactive Config
 
 ```bash
 snowcode config
 ```
 
-Supported backends:
-- **DashScope** (default): `DASHSCOPE_API_KEY`
-- **OpenAI-compatible**: `OPENAI_API_KEY` + `OPENAI_BASE_URL`
-- **Ollama** (local): `OLLAMA_URL` + `OLLAMA_MODEL`
-
-### Step 3: Index Your Project
-
-```bash
-# Navigate to your project directory
-cd /path/to/your/project
-
-# Build the index
-snowcode ingest
-
-# Or force rebuild
-snowcode ingest --reset
-```
-
-### Step 4: Start Using
-
-```bash
-# Ask questions
-snowcode ask "How does authentication work?"
-
-# Interactive chat
-snowcode chat
-
-# Agent mode (autonomous exploration)
-snowcode agent2 "Analyze the project architecture"
-
-# Agent with multi-agent coordination
-snowcode agent2 --multi-agent --workers 2 "Perform a security audit"
-
-# Agent with file creation (generates Markdown reports)
-snowcode agent2 "Generate a Markdown architecture diagram"
-```
-
-### Docker Deployment (Optional)
-
-```dockerfile
-FROM python:3.12-slim
-
-WORKDIR /app
-COPY . .
-RUN pip install -e ".[multimodal,scientific]"
-
-# Set API key at runtime
-ENV DASHSCOPE_API_KEY=your-api-key
-
-CMD ["snowcode", "ingest"]
-```
-
-Build and run:
-
-```bash
-docker build -t snowcode .
-docker run -v $(pwd):/workspace -w /workspace snowcode snowcode ingest
-docker run -v $(pwd):/workspace -w /workspace snowcode snowcode agent2 "Analyze codebase"
-```
-
-### Dependencies
-
-| Package | Version | Role |
-|:--------|:--------|:-----|
-| `click` | ≥8.1 | CLI framework |
-| `numpy` | ≥1.24 | Vector storage |
-| `sentence-transformers` | ≥3.0 | Embedding + reranking |
-| `tree-sitter` | ≥0.22 | AST parsing |
-| `tree-sitter-languages` | ≥1.10 | Pre-built grammars |
-| `prompt-toolkit` | ≥3.0 | Interactive REPL |
-| `rich` | ≥13.0 | Terminal rendering |
-| `pathspec` | ≥0.12 | .gitignore parsing |
-| `openai` | ≥1.0 | LLM API client |
-| `httpx` | ≥0.27 | Ollama HTTP client |
+Stores settings in `.snowcode/config.json` per project.
 
 ---
 
@@ -346,48 +239,24 @@ All project data stored in `.snowcode/`:
 
 ```
 .snowcode/
-├── config.json              # Index configuration
-├── embeddings.npy           # Vector matrix (N × 768 float32)
-├── metadata.json            # Chunk metadata (file, lines, index)
-├── file_hashes.json         # File hashes for incremental indexing
+├── config.json              # Index & LLM configuration
+├── embeddings.npy           # Vector matrix (N × 768)
+├── metadata.json            # Chunk metadata
+├── file_hashes.json         # Incremental indexing
 ├── bm25.json                # BM25 inverted index
-├── chat_history.json        # Persistent chat memory
+├── chat_history.json        # Chat memory
 └── memory.jsonl             # Agent long-term memory
 ```
 
 ---
 
-## Supported Languages
-
-**AST-Aware** (Tree-sitter): Python, JavaScript, TypeScript, TSX, Go, Rust, Java, C, C++, Ruby, PHP, C#, Kotlin, Swift, Lua, Bash, SQL, R, HTML, CSS
-
-**Regex Fallback**: 40+ additional languages via pattern matching
-
-**Auto-Skipped**: `.git`, `__pycache__`, `node_modules`, `.venv`, `dist`, `build`, `.snowcode`
-
----
-
 ## Privacy & Security
 
-- **Zero Cloud Dependency**: Embedding, indexing, BM25, and AST parsing all execute locally
-- **LLM Optional**: System operates in retrieval-only mode without any LLM configured
-- **Path Containment**: All file operations validated against project root via `resolve()` + `is_relative_to()`
-- **Input Sanitization**: Regex patterns length-limited, search lines truncated, ReDoS protected
-- **Backup Safety**: All write/delete operations create `.bak`/`.deleted` backups
-- **No Telemetry**: No analytics, no usage tracking, no external calls beyond optional LLM API
-
----
-
-## Project Statistics
-
-| Metric | Value |
-|:-------|:------|
-| Total Python LOC | ~4,400 |
-| Modules | 11 |
-| CLI Commands | 16 |
-| Agent Tools | 11 |
-| Skills | 7 |
-| Supported Languages | 20+ (AST) / 40+ (regex) |
+- **Local Indexing**: All embedding, BM25, and parsing runs locally
+- **Path Validation**: All file operations restricted to project root
+- **Backup Safety**: Destructive operations create `.bak` backups
+- **No Telemetry**: Zero analytics or external tracking
+- **Optional LLM**: Works in retrieval-only mode without any API key
 
 ---
 
