@@ -444,7 +444,7 @@ class WriteFileTool(BaseTool):
         return False
     
     def check_permission(self, params: dict) -> ToolPermission:
-        return ToolPermission.ALLOWED
+        return ToolPermission.PROMPT
     
     def run(self, params: dict, ctx: ToolExecutionContext) -> str:
         path = params.get("path", "")
@@ -553,7 +553,7 @@ class ShellTool(BaseTool):
         for blocked in self._BLOCKED_COMMANDS:
             if blocked in cmd:
                 return ToolPermission.DENIED
-        return ToolPermission.ALLOWED
+        return ToolPermission.PROMPT
     
     def run(self, params: dict, ctx: ToolExecutionContext) -> str:
         import subprocess
