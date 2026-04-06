@@ -35,9 +35,10 @@ from typing import Any, Protocol, runtime_checkable
 import concurrent.futures
 
 from .config import get_snowcode_dir
-from .rag import _get_llm_config, _call_llm
+from .rag import _get_llm_config, _call_llm, _format_context
 from .scanner import scan_files, read_file
 from .store import VectorStore
+from . import skills
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -596,6 +597,142 @@ class ShellTool(BaseTool):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Skill Tools for Agent2
+# ═══════════════════════════════════════════════════════════════════════
+
+class _ExplainTool(BaseTool):
+    """Explain a function, class, or file in detail."""
+    name = "explain"
+    description = "详细解释代码功能、原理和逻辑，适合理解陌生代码"
+    search_hint = "explain code"
+    
+    @property
+    def parameters(self):
+        return {"target": "要解释的代码目标（函数名、类名、文件名或描述）"}
+    
+    def is_read_only(self) -> bool:
+        return True
+    
+    def run(self, params: dict, ctx: ToolExecutionContext) -> str:
+        target = params.get("target", "")
+        if not target:
+            return "Error: target required"
+        
+        result = skills.run_skill(ctx.store, "explain", target)
+        return result.get("answer", "未找到相关代码")
+
+
+class _ReviewTool(BaseTool):
+    """Code review: find bugs, security issues, and quality problems."""
+    name = "review"
+    description = "代码审查，查找Bug、安全漏洞、性能问题和代码质量缺陷"
+    search_hint = "review code quality"
+    
+    @property
+    def parameters(self):
+        return {"target": "要审查的代码目标（留空=审查整个项目）"}
+    
+    def is_read_only(self) -> bool:
+        return True
+    
+    def run(self, params: dict, ctx: ToolExecutionContext) -> str:
+        target = params.get("target", "审查整个项目的核心代码")
+        result = skills.run_skill(ctx.store, "review", target)
+        return result.get("answer", "未找到相关代码")
+
+
+class _SummaryTool(BaseTool):
+    """Generate project architecture summary."""
+    name = "summary"
+    description = "生成项目架构概览，包括模块职责、数据流和技术栈"
+    search_hint = "project architecture summary"
+    
+    @property
+    def parameters(self):
+        return {"target": "分析目标（留空=整个项目）"}
+    
+    def is_read_only(self) -> bool:
+        return True
+    
+    def run(self, params: dict, ctx: ToolExecutionContext) -> str:
+        target = params.get("target", "生成项目架构概览")
+        result = skills.run_skill(ctx.store, "summary", target)
+        return result.get("answer", "未找到相关代码")
+
+
+class _TraceTool(BaseTool):
+    """Trace function call chain."""
+    name = "trace"
+    description = "追踪函数/方法的调用链，从入口到目标的完整路径"
+    search_hint = "trace function call chain"
+    
+    @property
+    def parameters(self):
+        return {"target": "要追踪的函数/方法名"}
+    
+    def is_read_only(self) -> bool:
+        return True
+    
+    def run(self, params: dict, ctx: ToolExecutionContext) -> str:
+        target = params.get("target", "")
+        if not target:
+            return "Error: target required (function/method name)"
+        
+        result = skills.run_skill(ctx.store, "trace", target)
+        return result.get("answer", "未找到相关代码")
+
+
+class _CompareTool(BaseTool):
+    """Compare two files or modules."""
+    name = "compare"
+    description = "对比两个文件/模块的异同，分析设计差异和适用场景"
+    search_hint = "compare two files"
+    
+    @property
+    def parameters(self):
+        return {
+            "file_a": "第一个文件路径或名称",
+            "file_b": "第二个文件路径或名称"
+        }
+    
+    def is_read_only(self) -> bool:
+        return True
+    
+    def run(self, params: dict, ctx: ToolExecutionContext) -> str:
+        file_a = params.get("file_a", "")
+        file_b = params.get("file_b", "")
+        
+        if not file_a or not file_b:
+            return "Error: both file_a and file_b required"
+        
+        target = f"对比 {file_a} 和 {file_b} 的异同"
+        result = skills.run_skill(ctx.store, "compare", target)
+        return result.get("answer", "未找到相关代码")
+
+
+class _TestSuggestTool(BaseTool):
+    """Suggest test cases for a function or module."""
+    name = "test_suggest"
+    description = "为指定代码生成测试用例建议，覆盖核心功能、边界条件和异常处理"
+    search_hint = "suggest test cases"
+    
+    @property
+    def parameters(self):
+        return {"target": "要生成测试的代码目标（函数名、模块名）"}
+    
+    def is_read_only(self) -> bool:
+        return True
+    
+    def run(self, params: dict, ctx: ToolExecutionContext) -> str:
+        target = params.get("target", "")
+        if not target:
+            return "Error: target required"
+        
+        result = skills.run_skill(ctx.store, "test", target)
+        return result.get("answer", "未找到相关代码")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Multimodal Tools for Agent2
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1134,6 +1271,13 @@ def build_default_registry() -> ToolRegistry:
     reg.register(WriteFileTool())
     reg.register(SearchReplaceTool())
     reg.register(ShellTool())
+    # Skill tools
+    reg.register(_ExplainTool())
+    reg.register(_ReviewTool())
+    reg.register(_SummaryTool())
+    reg.register(_TraceTool())
+    reg.register(_CompareTool())
+    reg.register(_TestSuggestTool())
     # Multimodal tools
     reg.register(_ImageReaderTool())
     reg.register(_PDFReaderTool())
