@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 import sys
 import os
+import shutil
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,14 +28,29 @@ from codechat.agent_v2 import (
     ReadFileTool,
     FindPatternTool,
     ListDirTool,
+    RepoMapTool,
     WriteFileTool,
     SearchReplaceTool,
     ShellTool,
+    Planner,
+    _EnhancedSummaryTool,
+    _DataReaderTool,
+    AutoVerifier,
     build_default_registry,
     CodeAgent,
     MultiAgentCoordinator,
     AgentResult,
 )
+from codechat.repo_map import RepositoryMap
+
+
+def _local_test_workspace(name: str) -> Path:
+    """Create a writable workspace inside the repository for Windows-restricted environments."""
+    root = Path(__file__).resolve().parent.parent / "smoke_check" / "pytest_workspaces" / name
+    if root.exists():
+        shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 class TestToolResult:
@@ -345,6 +361,64 @@ class TestListDirTool:
             assert "file1.txt" in result
 
 
+class TestRepoMapTool:
+    """Test repository map support."""
+
+    def test_run_with_symbol_focus(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pkg = root / "pkg"
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text("", encoding="utf-8")
+            (pkg / "service.py").write_text(
+                "from .helpers import helper\n\nclass Service:\n    pass\n\ndef run():\n    return helper()\n",
+                encoding="utf-8",
+            )
+            (pkg / "helpers.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
+
+            repo_map = RepositoryMap(root)
+            ctx = ToolExecutionContext(root=root, repo_map=repo_map)
+            tool = RepoMapTool()
+
+            result = tool.run({"focus": "Service"}, ctx)
+
+            assert "Service" in result
+            assert "pkg/service.py" in result
+
+
+class TestSummaryTool:
+    """Test summary fallback behavior."""
+
+    def test_summary_falls_back_to_repo_map_without_store(self):
+        root = _local_test_workspace("summary_tool")
+        pkg = root / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        (pkg / "service.py").write_text("class Service:\n    pass\n", encoding="utf-8")
+
+        ctx = ToolExecutionContext(root=root, repo_map=RepositoryMap(root), store=None)
+        tool = _EnhancedSummaryTool()
+
+        result = tool.run({"target": "project architecture"}, ctx)
+
+        assert "Repository map" in result
+        assert "pkg/service.py" in result
+
+
+class TestPlannerHints:
+    """Test planner hint normalization."""
+
+    def test_repo_steps_prefer_repo_map(self):
+        class StubLLM:
+            def complete(self, system, user, temperature=0.2):
+                return '[{"index": 1, "description": "分析项目整体架构和目录入口", "tool_hint": "summary"}]'
+
+        planner = Planner(StubLLM(), "repo_map, search, read_file")
+        plan = planner.create_plan("Explain this repository")
+
+        assert plan.steps[0].tool_hint == "repo_map"
+
+
 class TestShellTool:
     """Test ShellTool."""
     
@@ -376,6 +450,12 @@ class TestShellTool:
             
             assert "hello" in result.lower() or "no output" in result.lower()
 
+    def test_interpret_output_exit_code(self):
+        tool = ShellTool()
+        success, metadata = tool.interpret_output("boom\n[exit code: 1]")
+        assert success is False
+        assert metadata["exit_code"] == 1
+
 
 class TestWriteFileTool:
     """Test WriteFileTool."""
@@ -403,6 +483,42 @@ class TestWriteFileTool:
             assert "success" in result.lower()
             assert (root / "new_file.py").exists()
             assert (root / "new_file.py").read_text() == "print('hello')"
+
+
+class TestAutoVerifier:
+    """Test automatic verification command inference."""
+
+    def test_infer_python_test_command(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+            (root / "codechat").mkdir()
+            (root / "tests").mkdir()
+            (root / "codechat" / "agent_v2.py").write_text("def answer():\n    return 1\n", encoding="utf-8")
+            (root / "tests" / "test_agent_v2.py").write_text("def test_answer():\n    assert True\n", encoding="utf-8")
+
+            verifier = AutoVerifier(root, build_default_registry())
+            commands = verifier.infer_commands(["codechat/agent_v2.py"])
+
+            assert commands
+            assert "pytest" in commands[0]
+            assert "tests/test_agent_v2.py" in commands[0]
+
+
+class TestDataReaderTool:
+    """Test structured data reader support."""
+
+    def test_read_json_preview(self):
+        root = _local_test_workspace("data_reader")
+        payload = root / "payload.json"
+        payload.write_text('{"name": "demo", "values": [1, 2, 3]}', encoding="utf-8")
+
+        ctx = ToolExecutionContext(root=root)
+        tool = _DataReaderTool()
+        result = tool.run({"path": "payload.json", "mode": "preview"}, ctx)
+
+        assert "payload.json" in result
+        assert '"name": "demo"' in result
 
 
 class TestCodeAgent:
@@ -493,9 +609,12 @@ class TestBuildDefaultRegistry:
             "read_file",
             "find_pattern",
             "list_dir",
+            "repo_map",
             "write_file",
             "search_replace",
             "shell",
+            "data_reader",
+            "mat_reader",
         ]
         
         for tool_name in expected_tools:

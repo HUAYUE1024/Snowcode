@@ -25,8 +25,12 @@ def _extract_file_info(file_path: Path) -> dict:
     except Exception:
         return result
 
-    parser = _get_parser(lang_name)
-    lang_obj = _get_language(lang_name) if parser else None
+    try:
+        parser = _get_parser(lang_name)
+        lang_obj = _get_language(lang_name) if parser else None
+    except Exception:
+        parser = None
+        lang_obj = None
 
     # Use Tree-sitter if available
     if parser and lang_obj:

@@ -26,6 +26,7 @@ import os
 import re
 import time
 import threading
+import difflib
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -36,6 +37,7 @@ import concurrent.futures
 
 from .config import get_snowcode_dir
 from .rag import _get_llm_config, _call_llm, _format_context
+from .repo_map import RepositoryMap
 from .scanner import scan_files, read_file
 from .store import VectorStore
 from . import skills
@@ -77,11 +79,13 @@ class ToolExecutionContext:
     """Context passed to tools during execution."""
     root: Path
     store: VectorStore | None = None
+    repo_map: RepositoryMap | None = None
     llm: Any = None
     agent_id: str = ""
     session_id: str = ""
     abort_signal: threading.Event | None = None
     on_progress: Callable[[str], None] | None = None
+    confirm_tool: Callable[[str, dict, ToolPermission, str | None], bool] | None = None
 
 
 @runtime_checkable
@@ -144,6 +148,38 @@ class BaseTool(ABC):
     def validate_input(self, params: dict) -> str | None:
         """Validate input parameters. Returns error message or None."""
         return None
+
+    def get_confirmation_details(self, params: dict, ctx: ToolExecutionContext) -> str | None:
+        """Provide optional confirmation details such as a diff preview."""
+        return None
+
+    def interpret_output(self, output: str) -> tuple[bool, dict[str, Any]]:
+        """Infer whether tool output represents success, failure, or an empty result."""
+        stripped = output.strip()
+        if not stripped:
+            return True, {}
+
+        error_prefixes = (
+            "Error:",
+            "Access denied",
+            "Permission denied",
+            "File not found:",
+            "Cannot read:",
+            "Invalid regex:",
+            "[LLM Error]",
+        )
+        if stripped.startswith(error_prefixes):
+            return False, {"status": "error"}
+
+        empty_markers = {
+            "No results found.",
+            "No matches.",
+            "No results from workers.",
+        }
+        if stripped in empty_markers:
+            return True, {"status": "empty", "empty_result": True}
+
+        return True, {"status": "ok"}
     
     def format_output(self, output: str) -> str:
         """Format and truncate output if needed."""
@@ -154,6 +190,142 @@ class BaseTool(ABC):
     def get_activity_description(self, params: dict) -> str:
         """Human-readable description for progress display."""
         return f"Running {self.name}"
+
+
+def _build_diff_preview(
+    old_text: str,
+    new_text: str,
+    rel_path: str,
+    max_lines: int = 160,
+    context_lines: int = 3,
+) -> str:
+    """Build a truncated unified diff preview."""
+    diff_lines = list(difflib.unified_diff(
+        old_text.splitlines(),
+        new_text.splitlines(),
+        fromfile=f"a/{rel_path}",
+        tofile=f"b/{rel_path}",
+        n=context_lines,
+        lineterm="",
+    ))
+    if not diff_lines:
+        return "No textual changes."
+    if len(diff_lines) > max_lines:
+        shown = diff_lines[:max_lines]
+        shown.append(f"... [Diff truncated, {len(diff_lines)} total lines]")
+        diff_lines = shown
+    return "\n".join(diff_lines)
+
+
+def _format_size(size_bytes: int) -> str:
+    """Format a file size for tool output."""
+    size = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _truncate_text(text: str, max_chars: int = 4000) -> str:
+    """Truncate long previews to keep tool output compact."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n... [Truncated: {len(text)} chars total]"
+
+
+def _limit_preview_value(value: Any, max_items: int = 10) -> Any:
+    """Shrink large structured objects before rendering them."""
+    if isinstance(value, dict):
+        limited: dict[str, Any] = {}
+        for key in list(value.keys())[:max_items]:
+            limited[str(key)] = value[key]
+        return limited
+    if isinstance(value, (list, tuple)):
+        return list(value[:max_items])
+    return value
+
+
+def _preview_data(value: Any, max_items: int = 10, max_chars: int = 4000) -> str:
+    """Render structured data in a compact human-readable form."""
+    limited = _limit_preview_value(value, max_items=max_items)
+    try:
+        rendered = json.dumps(limited, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        rendered = repr(limited)
+    return _truncate_text(rendered, max_chars=max_chars)
+
+
+def _numeric_stats(value: Any) -> str:
+    """Return numeric stats for an array-like value when possible."""
+    try:
+        import numpy as np
+
+        arr = np.asarray(value)
+    except Exception:
+        return ""
+
+    if arr.size == 0 or not np.issubdtype(arr.dtype, np.number):
+        return ""
+
+    flattened = arr.astype(float, copy=False).reshape(-1)
+    finite = flattened[np.isfinite(flattened)]
+    lines = [f"Shape: {list(arr.shape)}", f"Dtype: {arr.dtype}", f"Elements: {int(arr.size)}"]
+    if finite.size == 0:
+        lines.append("No finite numeric values available.")
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            f"Min: {finite.min():.6f}",
+            f"Max: {finite.max():.6f}",
+            f"Mean: {finite.mean():.6f}",
+            f"Std: {finite.std():.6f}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _resolve_nested_key(value: Any, key: str) -> Any:
+    """Resolve a dotted key path against nested dict/list structures."""
+    if not key:
+        return value
+
+    current = value
+    parts = [part for part in key.replace("[", ".").replace("]", "").split(".") if part]
+    for part in parts:
+        if isinstance(current, dict):
+            if part not in current:
+                raise KeyError(part)
+            current = current[part]
+            continue
+
+        if isinstance(current, (list, tuple)):
+            index = int(part)
+            current = current[index]
+            continue
+
+        raise KeyError(part)
+    return current
+
+
+def _looks_like_skill_fallback(answer: str) -> bool:
+    """Detect skill responses that are likely fallback text rather than a real answer."""
+    normalized = (answer or "").strip().lower()
+    if not normalized:
+        return True
+    fallback_markers = (
+        "run `snowcode ingest` first",
+        "no vector index",
+        "not found",
+        "llm",
+        "api key",
+        "未找到相关代码",
+        "先运行",
+        "未配置",
+        "llm 不可用",
+    )
+    return any(marker in normalized for marker in fallback_markers)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -429,6 +601,39 @@ class ListDirTool(BaseTool):
                 lines.append(f"{prefix}{e.name}  [{ss}]")
 
 
+class RepoMapTool(BaseTool):
+    """Summarize repository structure, symbols, and internal dependencies."""
+
+    name = "repo_map"
+    description = "生成仓库结构图、符号索引和内部依赖关系，适合架构理解和定位入口"
+    search_hint = "repository map architecture symbols dependencies"
+
+    @property
+    def parameters(self):
+        return {
+            "focus": "可选：文件、目录、模块名或符号名",
+            "max_files": "最多展示多少个文件（默认8）",
+        }
+
+    def is_read_only(self) -> bool:
+        return True
+
+    def run(self, params: dict, ctx: ToolExecutionContext) -> str:
+        if not ctx.repo_map:
+            return "Error: repository map not available"
+
+        focus = str(params.get("focus", "")).strip()
+        max_files = int(params.get("max_files", 8))
+        max_files = max(1, min(max_files, 20))
+        return ctx.repo_map.render(focus=focus, max_files=max_files)
+
+    def get_activity_description(self, params: dict) -> str:
+        focus = str(params.get("focus", "")).strip()
+        if focus:
+            return f"Building repository map for {focus[:50]}"
+        return "Building repository map"
+
+
 class WriteFileTool(BaseTool):
     """Write file with backup."""
     
@@ -445,6 +650,33 @@ class WriteFileTool(BaseTool):
     
     def check_permission(self, params: dict) -> ToolPermission:
         return ToolPermission.PROMPT
+
+    def _resolve_target(self, path: str, ctx: ToolExecutionContext) -> Path:
+        safe_path = path.lstrip("/").lstrip("\\")
+        return (ctx.root / safe_path).resolve()
+
+    def get_confirmation_details(self, params: dict, ctx: ToolExecutionContext) -> str | None:
+        path = params.get("path", "")
+        content = params.get("content", "")
+        if not path or content is None:
+            return None
+
+        try:
+            full = self._resolve_target(path, ctx)
+            if not full.is_relative_to(ctx.root):
+                return f"Cannot preview diff: path outside project root ({path})"
+
+            rel = str(full.relative_to(ctx.root))
+            if full.exists():
+                old_text = read_file(full)
+                if old_text is None:
+                    return f"Cannot preview diff for `{rel}`: file is not readable as text."
+            else:
+                old_text = ""
+
+            return _build_diff_preview(old_text, content, rel)
+        except Exception as e:
+            return f"Cannot preview diff: {type(e).__name__}: {e}"
     
     def run(self, params: dict, ctx: ToolExecutionContext) -> str:
         path = params.get("path", "")
@@ -454,8 +686,7 @@ class WriteFileTool(BaseTool):
             return "Error: missing path or content arguments"
         
         try:
-            safe_path = path.lstrip("/").lstrip("\\")
-            full = (ctx.root / safe_path).resolve()
+            full = self._resolve_target(path, ctx)
             
             if not full.is_relative_to(ctx.root):
                 return f"Error: Cannot write outside project root: {path}"
@@ -497,7 +728,32 @@ class SearchReplaceTool(BaseTool):
         return False
     
     def check_permission(self, params: dict) -> ToolPermission:
-        return ToolPermission.ALLOWED
+        return ToolPermission.PROMPT
+
+    def get_confirmation_details(self, params: dict, ctx: ToolExecutionContext) -> str | None:
+        path = params.get("path", "")
+        old_str = params.get("old_str", "")
+        new_str = params.get("new_str", "")
+        if not path or not old_str:
+            return None
+
+        full = (ctx.root / path).resolve()
+        if not full.is_relative_to(ctx.root):
+            return f"Cannot preview diff: path outside project root ({path})"
+        if not full.exists():
+            return f"Cannot preview diff: file not found `{path}`"
+
+        try:
+            content = full.read_text(encoding="utf-8")
+        except Exception as e:
+            return f"Cannot preview diff: {type(e).__name__}: {e}"
+
+        if old_str not in content:
+            return f"Cannot preview diff: old_str not found in `{path}`"
+
+        new_content = content.replace(old_str, new_str, 1)
+        rel = str(full.relative_to(ctx.root))
+        return _build_diff_preview(content, new_content, rel)
     
     def run(self, params: dict, ctx: ToolExecutionContext) -> str:
         path = params.get("path", "")
@@ -554,6 +810,21 @@ class ShellTool(BaseTool):
             if blocked in cmd:
                 return ToolPermission.DENIED
         return ToolPermission.PROMPT
+
+    def interpret_output(self, output: str) -> tuple[bool, dict[str, Any]]:
+        success, metadata = super().interpret_output(output)
+        if not success:
+            return success, metadata
+
+        match = re.search(r"\[exit code:\s*(-?\d+)\]\s*$", output.strip())
+        if match:
+            exit_code = int(match.group(1))
+            metadata = dict(metadata)
+            metadata["exit_code"] = exit_code
+            if exit_code != 0:
+                metadata["status"] = "error"
+                return False, metadata
+        return True, metadata
     
     def run(self, params: dict, ctx: ToolExecutionContext) -> str:
         import subprocess
@@ -658,6 +929,48 @@ class _SummaryTool(BaseTool):
         target = params.get("target", "生成项目架构概览")
         result = skills.run_skill(ctx.store, "summary", target)
         return result.get("answer", "未找到相关代码")
+
+
+class _EnhancedSummaryTool(_SummaryTool):
+    """Summary tool with repository-map fallback for weak skill results."""
+
+    def run(self, params: dict, ctx: ToolExecutionContext) -> str:
+        target = params.get("target", "project summary")
+        repo_summary = ""
+        if ctx.repo_map:
+            focus = "" if self._is_generic_target(target) else target
+            repo_summary = ctx.repo_map.render(focus=focus)
+
+        if not ctx.store:
+            return repo_summary or "No vector index available for summary."
+
+        try:
+            result = skills.run_skill(ctx.store, "summary", target)
+        except Exception as exc:
+            return repo_summary or f"Error: summary skill failed: {exc}"
+
+        answer = result.get("answer", "").strip()
+        if repo_summary and _looks_like_skill_fallback(answer):
+            return repo_summary
+        return answer or repo_summary or "No summary available."
+
+    def _is_generic_target(self, target: str) -> bool:
+        normalized = (target or "").strip().lower()
+        if not normalized:
+            return True
+        generic_markers = (
+            "summary",
+            "architecture",
+            "project",
+            "repo",
+            "repository",
+            "overview",
+            "项目",
+            "架构",
+            "整体",
+            "概览",
+        )
+        return any(marker in normalized for marker in generic_markers)
 
 
 class _TraceTool(BaseTool):
@@ -959,6 +1272,471 @@ class _DocumentReaderTool(BaseTool):
         return f"{size_bytes:.1f} TB"
 
 
+class _DataReaderTool(BaseTool):
+    """Read structured data files such as JSON, YAML, TOML, NPY, HDF5, and CSV."""
+
+    name = "data_reader"
+    description = "Read structured data files such as JSON, JSONL, YAML, TOML, INI, CSV, TSV, XML, NPY, NPZ, HDF5, Parquet, and Feather."
+    search_hint = "read structured data file"
+
+    _TEXT_STRUCTURED_EXTS = {".json", ".jsonl", ".ndjson", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml"}
+    _TABULAR_EXTS = {".csv", ".tsv"}
+    _ARRAY_EXTS = {".npy", ".npz"}
+    _OPTIONAL_BINARY_EXTS = {".h5", ".hdf5", ".parquet", ".feather"}
+    _UNSAFE_EXTS = {".pkl", ".pickle"}
+
+    @property
+    def parameters(self):
+        return {
+            "path": "Structured data file path relative to the project root.",
+            "mode": "Read mode: 'preview', 'info', or 'stats'.",
+            "key": "Optional dataset/key path for nested values, NPZ archives, or HDF5 datasets.",
+            "max_rows": "Maximum preview rows/items (default: 20).",
+        }
+
+    def is_read_only(self) -> bool:
+        return True
+
+    def run(self, params: dict, ctx: ToolExecutionContext) -> str:
+        rel_path = str(params.get("path", "")).strip()
+        if not rel_path:
+            return "Error: path required"
+        file_path = (ctx.root / rel_path).resolve()
+        mode = str(params.get("mode", "preview")).strip().lower() or "preview"
+        key = str(params.get("key", "")).strip()
+        max_rows = max(1, int(params.get("max_rows", 20)))
+
+        if not file_path.exists():
+            return f"Error: file not found: {rel_path}"
+        if not file_path.is_relative_to(ctx.root):
+            return "Error: path outside project root"
+
+        ext = file_path.suffix.lower()
+        if ext in self._UNSAFE_EXTS:
+            return "Error: pickle-style files are intentionally blocked for safety"
+
+        header = [
+            f"Data file: {file_path.name}",
+            f"Path: {file_path}",
+            f"Size: {_format_size(file_path.stat().st_size)}",
+            f"Format: {ext or '(no extension)'}",
+            f"Mode: {mode}",
+        ]
+        if key:
+            header.append(f"Key: {key}")
+        header.append("")
+
+        try:
+            if ext in {".json"}:
+                with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+                    data = json.load(handle)
+                return "\n".join(header + [self._render_structured_value(data, mode, key, max_rows)])
+
+            if ext in {".jsonl", ".ndjson"}:
+                rows = self._load_json_lines(file_path)
+                return "\n".join(header + [self._render_json_rows(rows, mode, max_rows)])
+
+            if ext in {".yaml", ".yml"}:
+                try:
+                    import yaml
+                except ImportError:
+                    return "Warning: PyYAML is not installed. Install it with: pip install PyYAML"
+                with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+                    data = yaml.safe_load(handle)
+                return "\n".join(header + [self._render_structured_value(data, mode, key, max_rows)])
+
+            if ext == ".toml":
+                try:
+                    import tomllib
+                except ModuleNotFoundError:
+                    try:
+                        import tomli as tomllib
+                    except ImportError:
+                        return "Warning: tomllib/tomli is not available. Install tomli on Python 3.10."
+                with open(file_path, "rb") as handle:
+                    data = tomllib.load(handle)
+                return "\n".join(header + [self._render_structured_value(data, mode, key, max_rows)])
+
+            if ext in {".ini", ".cfg", ".conf"}:
+                import configparser
+
+                parser = configparser.ConfigParser()
+                parser.read(file_path, encoding="utf-8")
+                data = {section: dict(parser.items(section)) for section in parser.sections()}
+                return "\n".join(header + [self._render_structured_value(data, mode, key, max_rows)])
+
+            if ext in self._TABULAR_EXTS:
+                delimiter = "\t" if ext == ".tsv" else ","
+                return "\n".join(header + [self._render_tabular_file(file_path, mode, delimiter, max_rows)])
+
+            if ext == ".xml":
+                from xml.etree import ElementTree as ET
+
+                tree = ET.parse(file_path)
+                root = tree.getroot()
+                return "\n".join(header + [self._render_xml(root, mode, max_rows)])
+
+            if ext == ".npy":
+                import numpy as np
+
+                data = np.load(file_path, allow_pickle=False)
+                return "\n".join(header + [self._render_array_value(data, mode, max_rows)])
+
+            if ext == ".npz":
+                import numpy as np
+
+                with np.load(file_path, allow_pickle=False) as archive:
+                    names = list(archive.files)
+                    if mode == "info":
+                        lines = [f"Arrays: {len(names)}"]
+                        for name in names[:max_rows]:
+                            arr = archive[name]
+                            lines.append(f"- {name}: shape={list(arr.shape)} dtype={arr.dtype}")
+                        return "\n".join(header + lines)
+
+                    selected_name = key or (names[0] if names else "")
+                    if not selected_name:
+                        return "\n".join(header + ["Archive is empty."])
+                    if selected_name not in archive:
+                        return "\n".join(header + [f"Error: array '{selected_name}' not found. Available: {', '.join(names)}"])
+                    return "\n".join(header + [self._render_array_value(archive[selected_name], mode, max_rows)])
+
+            if ext in {".h5", ".hdf5"}:
+                return "\n".join(header + [self._render_hdf5(file_path, mode, key, max_rows)])
+
+            if ext in {".parquet", ".feather"}:
+                return "\n".join(header + [self._render_columnar_file(file_path, mode, max_rows)])
+
+        except Exception as exc:
+            return "\n".join(header + [f"Error: failed to read data file: {exc}"])
+
+        supported = sorted(self._TEXT_STRUCTURED_EXTS | self._TABULAR_EXTS | self._ARRAY_EXTS | self._OPTIONAL_BINARY_EXTS)
+        return "Error: unsupported data format. Supported formats: " + ", ".join(supported)
+
+    def _render_structured_value(self, value: Any, mode: str, key: str, max_rows: int) -> str:
+        try:
+            selected = _resolve_nested_key(value, key)
+        except Exception as exc:
+            return f"Error: key lookup failed: {exc}"
+
+        if mode == "info":
+            return self._describe_value(selected)
+
+        if mode == "stats":
+            stats = _numeric_stats(selected)
+            if stats:
+                return stats
+            return self._describe_value(selected) + "\nNo numeric statistics available."
+
+        return _preview_data(selected, max_items=max_rows, max_chars=6000)
+
+    def _render_json_rows(self, rows: list[Any], mode: str, max_rows: int) -> str:
+        if mode == "info":
+            keys = []
+            for row in rows[:max_rows]:
+                if isinstance(row, dict):
+                    keys.extend(str(key) for key in row.keys())
+            summary = [f"Rows: {len(rows)}"]
+            if keys:
+                seen = list(dict.fromkeys(keys))
+                summary.append("Fields: " + ", ".join(seen[:20]))
+            return "\n".join(summary)
+
+        if mode == "stats":
+            stats = self._numeric_stats_from_mapping_rows(rows)
+            if stats:
+                return stats
+            return f"Rows: {len(rows)}\nNo numeric statistics available."
+
+        return _preview_data(rows[:max_rows], max_items=max_rows, max_chars=6000)
+
+    def _render_tabular_file(self, file_path: Path, mode: str, delimiter: str, max_rows: int) -> str:
+        import csv
+
+        with open(file_path, "r", encoding="utf-8", errors="replace", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter=delimiter)
+            fieldnames = reader.fieldnames or []
+            rows = []
+            total_rows = 0
+            numeric_columns: dict[str, list[float]] = {name: [] for name in fieldnames}
+
+            for row in reader:
+                total_rows += 1
+                if len(rows) < max_rows:
+                    rows.append(row)
+                for key, value in row.items():
+                    if key not in numeric_columns:
+                        numeric_columns[key] = []
+                    if value in (None, ""):
+                        continue
+                    try:
+                        numeric_columns[key].append(float(value))
+                    except Exception:
+                        continue
+
+        if mode == "info":
+            lines = [f"Rows: {total_rows}", f"Columns: {len(fieldnames)}"]
+            if fieldnames:
+                lines.append("Fields: " + ", ".join(fieldnames))
+            return "\n".join(lines)
+
+        if mode == "stats":
+            lines = [f"Rows: {total_rows}"]
+            for key, values in numeric_columns.items():
+                stats = _numeric_stats(values)
+                if stats:
+                    lines.append(f"\n[{key}]\n{stats}")
+            if len(lines) == 1:
+                lines.append("No numeric statistics available.")
+            return "\n".join(lines)
+
+        if not rows:
+            return "No rows available."
+        return _preview_data(rows, max_items=max_rows, max_chars=6000)
+
+    def _render_xml(self, root: Any, mode: str, max_rows: int) -> str:
+        nodes = []
+        for index, elem in enumerate(root.iter()):
+            if index >= max_rows:
+                break
+            nodes.append(
+                {
+                    "tag": elem.tag,
+                    "attributes": dict(elem.attrib),
+                    "text": (elem.text or "").strip()[:120],
+                }
+            )
+
+        if mode == "info":
+            return "\n".join(
+                [
+                    f"Root tag: {root.tag}",
+                    f"Immediate children: {len(list(root))}",
+                    f"Preview nodes: {len(nodes)}",
+                ]
+            )
+
+        if mode == "stats":
+            return "XML files expose structural information only; numeric statistics are not available."
+
+        return _preview_data(nodes, max_items=max_rows, max_chars=6000)
+
+    def _render_array_value(self, value: Any, mode: str, max_rows: int) -> str:
+        if mode == "info":
+            return self._describe_value(value)
+        if mode == "stats":
+            stats = _numeric_stats(value)
+            return stats or (self._describe_value(value) + "\nNo numeric statistics available.")
+        return _preview_data(value.tolist() if hasattr(value, "tolist") else value, max_items=max_rows, max_chars=6000)
+
+    def _render_hdf5(self, file_path: Path, mode: str, key: str, max_rows: int) -> str:
+        try:
+            import h5py
+        except ImportError:
+            return "Warning: h5py is not installed. Install it with: pip install h5py"
+
+        dataset_info: list[tuple[str, Any]] = []
+        with h5py.File(file_path, "r") as handle:
+            def visitor(name, obj):
+                if isinstance(obj, h5py.Dataset):
+                    dataset_info.append((name, obj))
+
+            handle.visititems(visitor)
+
+            if mode == "info":
+                lines = [f"Datasets: {len(dataset_info)}"]
+                for name, dataset in dataset_info[:max_rows]:
+                    lines.append(f"- {name}: shape={list(dataset.shape)} dtype={dataset.dtype}")
+                return "\n".join(lines)
+
+            dataset_name = key or (dataset_info[0][0] if dataset_info else "")
+            if not dataset_name:
+                return "No datasets available."
+            if dataset_name not in handle:
+                available = ", ".join(name for name, _ in dataset_info[:20])
+                return f"Error: dataset '{dataset_name}' not found. Available: {available}"
+
+            data = handle[dataset_name][()]
+            return self._render_array_value(data, mode, max_rows)
+
+    def _render_columnar_file(self, file_path: Path, mode: str, max_rows: int) -> str:
+        try:
+            import pandas as pd
+        except ImportError:
+            return "Warning: pandas/pyarrow are not installed. Install them with: pip install pandas pyarrow"
+
+        if file_path.suffix.lower() == ".parquet":
+            frame = pd.read_parquet(file_path)
+        else:
+            frame = pd.read_feather(file_path)
+
+        if mode == "info":
+            lines = [f"Rows: {len(frame)}", f"Columns: {len(frame.columns)}"]
+            lines.append("Fields: " + ", ".join(f"{name}:{dtype}" for name, dtype in frame.dtypes.items()))
+            return "\n".join(lines)
+
+        if mode == "stats":
+            return _truncate_text(frame.describe(include="all").to_string(), max_chars=6000)
+
+        return _truncate_text(frame.head(max_rows).to_string(index=False), max_chars=6000)
+
+    def _load_json_lines(self, file_path: Path) -> list[Any]:
+        rows = []
+        with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                rows.append(json.loads(line))
+        return rows
+
+    def _describe_value(self, value: Any) -> str:
+        if isinstance(value, dict):
+            keys = list(value.keys())
+            sample = ", ".join(str(key) for key in keys[:12]) or "(none)"
+            return f"Type: object\nKeys: {len(keys)}\nSample keys: {sample}"
+        if isinstance(value, list):
+            item_type = type(value[0]).__name__ if value else "unknown"
+            return f"Type: list\nLength: {len(value)}\nItem type: {item_type}"
+        if hasattr(value, "shape") and hasattr(value, "dtype"):
+            return f"Type: array\nShape: {list(value.shape)}\nDtype: {value.dtype}"
+        return f"Type: {type(value).__name__}\nPreview: {_truncate_text(str(value), max_chars=400)}"
+
+    def _numeric_stats_from_mapping_rows(self, rows: list[Any]) -> str:
+        numeric_columns: dict[str, list[float]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for key, value in row.items():
+                try:
+                    numeric_columns.setdefault(str(key), []).append(float(value))
+                except Exception:
+                    continue
+
+        lines = []
+        for key, values in numeric_columns.items():
+            stats = _numeric_stats(values)
+            if stats:
+                lines.append(f"[{key}]\n{stats}")
+        return "\n\n".join(lines)
+
+
+class _MatReaderTool(BaseTool):
+    """Read MATLAB MAT files."""
+
+    name = "mat_reader"
+    description = "Read MATLAB MAT files, list variables, preview arrays, and show numeric statistics."
+    search_hint = "read matlab mat file"
+
+    @property
+    def parameters(self):
+        return {
+            "path": "MAT file path relative to the project root.",
+            "mode": "Read mode: 'info', 'vars', 'data', or 'stats'.",
+            "variable": "Optional variable name for data/stat output.",
+            "max_items": "Maximum number of variables or preview items (default: 10).",
+        }
+
+    def is_read_only(self) -> bool:
+        return True
+
+    def run(self, params: dict, ctx: ToolExecutionContext) -> str:
+        rel_path = str(params.get("path", "")).strip()
+        if not rel_path:
+            return "Error: path required"
+        file_path = (ctx.root / rel_path).resolve()
+        mode = str(params.get("mode", "info")).strip().lower() or "info"
+        variable = str(params.get("variable", "")).strip()
+        max_items = max(1, int(params.get("max_items", 10)))
+
+        if not file_path.exists():
+            return f"Error: file not found: {rel_path}"
+        if not file_path.is_relative_to(ctx.root):
+            return "Error: path outside project root"
+        if file_path.suffix.lower() != ".mat":
+            return f"Error: not a MAT file: {rel_path}"
+
+        loaded = self._load_mat(file_path)
+        if isinstance(loaded, str):
+            return loaded
+
+        variables = {name: value for name, value in loaded.items() if not str(name).startswith("__")}
+        header = [
+            f"MAT file: {file_path.name}",
+            f"Path: {file_path}",
+            f"Size: {_format_size(file_path.stat().st_size)}",
+            f"Variables: {len(variables)}",
+            f"Mode: {mode}",
+            "",
+        ]
+
+        if mode in {"info", "vars"}:
+            lines = []
+            for name in list(variables.keys())[:max_items]:
+                lines.append(self._describe_variable(name, variables[name]))
+            if not lines:
+                lines.append("No variables available.")
+            return "\n".join(header + lines)
+
+        if mode not in {"data", "stats"}:
+            return "\n".join(header + [f"Error: unsupported mode '{mode}'"])
+
+        if not variable:
+            available = ", ".join(list(variables.keys())[:20]) or "(none)"
+            return "\n".join(header + [f"Available variables: {available}", "Pass variable=<name> for data or stats mode."])
+
+        if variable not in variables:
+            available = ", ".join(list(variables.keys())[:20]) or "(none)"
+            return "\n".join(header + [f"Error: variable '{variable}' not found. Available: {available}"])
+
+        value = variables[variable]
+        if mode == "stats":
+            stats = _numeric_stats(value)
+            if stats:
+                return "\n".join(header + [f"Variable: {variable}", stats])
+            return "\n".join(header + [f"Variable: {variable}", self._describe_variable(variable, value), "No numeric statistics available."])
+
+        preview_value = value.tolist() if hasattr(value, "tolist") else value
+        return "\n".join(header + [f"Variable: {variable}", _preview_data(preview_value, max_items=max_items, max_chars=6000)])
+
+    def _load_mat(self, file_path: Path) -> dict[str, Any] | str:
+        try:
+            from scipy.io import loadmat
+
+            data = loadmat(str(file_path), squeeze_me=True, struct_as_record=False)
+            return {str(name): value for name, value in data.items()}
+        except ImportError:
+            pass
+        except NotImplementedError:
+            pass
+        except ValueError as exc:
+            message = str(exc).lower()
+            if "hdf" not in message and "mat file" not in message:
+                return f"Error: failed to read MAT file: {exc}"
+
+        try:
+            import h5py
+        except ImportError:
+            return "Warning: scipy or h5py is required to read MAT files. Install with: pip install scipy h5py"
+
+        def _convert(obj):
+            if isinstance(obj, h5py.Dataset):
+                return obj[()]
+            return {name: _convert(child) for name, child in obj.items()}
+
+        with h5py.File(file_path, "r") as handle:
+            return {str(name): _convert(obj) for name, obj in handle.items()}
+
+    def _describe_variable(self, name: str, value: Any) -> str:
+        if hasattr(value, "shape") and hasattr(value, "dtype"):
+            return f"- {name}: shape={list(value.shape)} dtype={value.dtype}"
+        if isinstance(value, dict):
+            return f"- {name}: object with keys {', '.join(list(value.keys())[:8]) or '(none)'}"
+        if isinstance(value, (list, tuple)):
+            return f"- {name}: {type(value).__name__} length={len(value)}"
+        return f"- {name}: {type(value).__name__}"
+
+
 class _FileBrowserTool(BaseTool):
     """Browse files in a local directory."""
     name = "file_browser"
@@ -994,7 +1772,11 @@ class _FileBrowserTool(BaseTool):
             'images': {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '.svg'},
             'docs': {'.pdf', '.doc', '.docx', '.xls', '.xlsx', '.txt', '.md'},
             'code': {'.py', '.js', '.ts', '.java', '.c', '.cpp', '.go', '.rs', '.css', '.html'},
-            'data': {'.json', '.csv', '.xml', '.yaml', '.yml', '.toml', '.nc', '.nc4'},
+            'data': {
+                '.json', '.jsonl', '.ndjson', '.csv', '.tsv', '.xml', '.yaml', '.yml',
+                '.toml', '.ini', '.cfg', '.conf', '.npy', '.npz', '.mat',
+                '.h5', '.hdf5', '.parquet', '.feather', '.nc', '.nc4',
+            },
         }
         
         files = list(dir_path.rglob("*") if recursive else dir_path.iterdir())
@@ -1217,13 +1999,66 @@ class ToolRegistry:
         """Execute tool with concurrency control and progress reporting."""
         tool = self._tools.get(name)
         if not tool:
-            return ToolResult(False, f"Unknown tool: {name}", name)
+            return ToolResult(
+                False,
+                f"Unknown tool: {name}",
+                name,
+                metadata={"status": "unknown_tool"},
+            )
+
+        start = time.time()
+
+        perm = tool.check_permission(params)
+        if perm == ToolPermission.DENIED:
+            return ToolResult(
+                False,
+                f"Tool {name} is denied by policy",
+                name,
+                elapsed_ms=(time.time() - start) * 1000,
+                metadata={"status": "permission_denied", "permission": perm.value},
+            )
+
+        if perm in (ToolPermission.PROMPT, ToolPermission.DANGEROUS):
+            confirm = ctx.confirm_tool
+            details = tool.get_confirmation_details(params, ctx)
+            if not confirm:
+                return ToolResult(
+                    False,
+                    f"Tool {name} requires user confirmation, but no confirmation handler is available",
+                    name,
+                    elapsed_ms=(time.time() - start) * 1000,
+                    metadata={"status": "confirmation_required", "permission": perm.value},
+                )
+            if not confirm(name, params, perm, details):
+                return ToolResult(
+                    False,
+                    f"User declined permission for tool {name}",
+                    name,
+                    elapsed_ms=(time.time() - start) * 1000,
+                    metadata={"status": "user_declined", "permission": perm.value},
+                )
+
+        validation_error = tool.validate_input(params)
+        if validation_error:
+            return ToolResult(
+                False,
+                validation_error,
+                name,
+                elapsed_ms=(time.time() - start) * 1000,
+                metadata={"status": "invalid_input"},
+            )
         
         # Check concurrency
         if not tool.is_concurrent_safe():
             with self._lock:
                 if name in self._running_tools:
-                    return ToolResult(False, f"Tool {name} is already running", name)
+                    return ToolResult(
+                        False,
+                        f"Tool {name} is already running",
+                        name,
+                        elapsed_ms=(time.time() - start) * 1000,
+                        metadata={"status": "busy"},
+                    )
                 self._running_tools.add(name)
         
         try:
@@ -1231,20 +2066,23 @@ class ToolRegistry:
             if on_progress:
                 on_progress(tool.get_activity_description(params))
             
-            start = time.time()
             output = tool.run(params, ctx)
             elapsed = (time.time() - start) * 1000
             
             # Format output
             formatted = tool.format_output(output)
             is_truncated = len(output) > tool.max_result_size
+            success, metadata = tool.interpret_output(output)
+            metadata = dict(metadata)
+            metadata["is_truncated"] = is_truncated
             
             return ToolResult(
-                success=True,
+                success=success,
                 output=formatted,
                 tool_name=name,
                 elapsed_ms=elapsed,
-                is_truncated=is_truncated
+                is_truncated=is_truncated,
+                metadata=metadata,
             )
         except Exception as e:
             elapsed = (time.time() - start) * 1000
@@ -1252,7 +2090,8 @@ class ToolRegistry:
                 success=False,
                 output=f"{type(e).__name__}: {e}",
                 tool_name=name,
-                elapsed_ms=elapsed
+                elapsed_ms=elapsed,
+                metadata={"status": "exception"},
             )
         finally:
             if not tool.is_concurrent_safe():
@@ -1268,13 +2107,14 @@ def build_default_registry() -> ToolRegistry:
     reg.register(ReadFileTool())
     reg.register(FindPatternTool())
     reg.register(ListDirTool())
+    reg.register(RepoMapTool())
     reg.register(WriteFileTool())
     reg.register(SearchReplaceTool())
     reg.register(ShellTool())
     # Skill tools
     reg.register(_ExplainTool())
     reg.register(_ReviewTool())
-    reg.register(_SummaryTool())
+    reg.register(_EnhancedSummaryTool())
     reg.register(_TraceTool())
     reg.register(_CompareTool())
     reg.register(_TestSuggestTool())
@@ -1282,6 +2122,8 @@ def build_default_registry() -> ToolRegistry:
     reg.register(_ImageReaderTool())
     reg.register(_PDFReaderTool())
     reg.register(_DocumentReaderTool())
+    reg.register(_DataReaderTool())
+    reg.register(_MatReaderTool())
     reg.register(_FileBrowserTool())
     reg.register(_NCDataReaderTool())
     return reg
@@ -1655,6 +2497,7 @@ class Planner:
         if not steps:
             steps = [PlanStep(index=1, description=f"搜索并回答: {goal}", tool_hint="search")]
         
+        steps = self._normalize_steps(steps)
         return Plan(goal=goal, steps=steps)
     
     def refine_plan(self, plan: Plan, observation: str) -> Plan:
@@ -1663,6 +2506,9 @@ class Planner:
         for s in failed:
             s.status = "pending"
             s.tool_hint = "find_pattern" if s.tool_hint == "search" else "search"
+            summary = observation.strip().splitlines()[0] if observation else ""
+            if summary:
+                s.result = summary[:200]
         return plan
     
     def _parse_steps(self, raw: str) -> list[PlanStep]:
@@ -1703,6 +2549,321 @@ class Planner:
             pass
         
         return []
+
+    def _normalize_steps(self, steps: list[PlanStep]) -> list[PlanStep]:
+        normalized: list[PlanStep] = []
+        for item in steps:
+            description = (item.description or "").strip()
+            if not description:
+                continue
+            normalized.append(
+                PlanStep(
+                    index=len(normalized) + 1,
+                    description=description,
+                    tool_hint=self._normalize_tool_hint(description, item.tool_hint),
+                    status=item.status,
+                    result=item.result,
+                )
+            )
+        return normalized
+
+    def _normalize_tool_hint(self, description: str, tool_hint: str) -> str:
+        desc = description.lower()
+        hint = (tool_hint or "").strip()
+        normalized_hint = hint.lower()
+
+        repo_keywords = (
+            "架构", "结构", "目录", "技术栈", "入口", "模块", "项目", "仓库", "repo",
+            "repository", "overview", "summary", "architecture", "layout",
+        )
+        search_keywords = (
+            "相关", "已有", "历史", "接口", "调用", "引用", "查找", "检索",
+            "search", "find", "lookup", "reference",
+        )
+        write_keywords = ("编写", "实现", "修改", "新增", "重构", "修复", "write", "edit", "implement")
+        verify_keywords = ("验证", "测试", "检查", "review", "test", "verify", "lint")
+
+        if any(keyword in desc for keyword in repo_keywords):
+            return "repo_map"
+        if any(keyword in desc for keyword in search_keywords) and normalized_hint in {"", "summary", "repo_map"}:
+            return "search"
+        if any(keyword in desc for keyword in write_keywords) and not normalized_hint:
+            return "write_file"
+        if any(keyword in desc for keyword in verify_keywords) and not normalized_hint:
+            return "test_suggest"
+        if normalized_hint == "summary":
+            return "repo_map"
+        return hint
+
+
+@dataclass
+class VerificationResult:
+    """Result of verifying whether a plan step is complete."""
+    status: str  # done / continue / failed
+    summary: str = ""
+    next_action: str = ""
+
+
+VERIFIER_PROMPT = """\
+You verify whether a coding agent completed the current plan step.
+
+Return JSON only:
+{"status": "done|continue|failed", "summary": "short reason", "next_action": "what the agent should do next"}
+
+Rules:
+1. Use "done" only if the tool result materially completes the current plan step.
+2. Use "continue" if the result is partial, empty, or suggests another tool/read is needed.
+3. Use "failed" if the result is an error, permission issue, or the chosen action was clearly wrong.
+4. Keep summary and next_action concise.
+"""
+
+
+class Verifier:
+    """Verify each execution step before advancing the plan."""
+
+    def __init__(self, llm: LLMClient):
+        self.llm = llm
+
+    def verify_step(
+        self,
+        goal: str,
+        step: PlanStep,
+        tool_name: str,
+        params: dict[str, Any],
+        result: ToolResult,
+    ) -> VerificationResult:
+        """Verify whether the current step is complete."""
+        status = result.metadata.get("status", "")
+        if not result.success:
+            return VerificationResult(
+                status="failed",
+                summary=result.output[:200],
+                next_action="Choose a safer or more suitable tool and retry the same step.",
+            )
+
+        if result.metadata.get("empty_result"):
+            return VerificationResult(
+                status="continue",
+                summary=f"{tool_name} returned no useful result for this step.",
+                next_action="Try a narrower search, another file, or a different read-only tool.",
+            )
+
+        if not self.llm.available:
+            return VerificationResult(
+                status="done",
+                summary=f"{tool_name} returned a usable result.",
+            )
+
+        user_msg = (
+            f"User goal: {goal}\n"
+            f"Current step: {step.description}\n"
+            f"Suggested tool: {step.tool_hint or 'general'}\n"
+            f"Executed tool: {tool_name}\n"
+            f"Params: {json.dumps(params, ensure_ascii=False)}\n"
+            f"Tool result:\n{result.output[:4000]}"
+        )
+        raw = self.llm.complete(VERIFIER_PROMPT, user_msg, temperature=0.1, use_cache=True)
+        parsed = self._parse(raw)
+        verdict = str(parsed.get("status", "done")).strip().lower()
+        if verdict not in {"done", "continue", "failed"}:
+            verdict = "done"
+        return VerificationResult(
+            status=verdict,
+            summary=str(parsed.get("summary", "")).strip()[:240],
+            next_action=str(parsed.get("next_action", "")).strip()[:240],
+        )
+
+    def _parse(self, raw: str) -> dict[str, Any]:
+        raw = (raw or "").strip()
+        if not raw:
+            return {}
+
+        json_blocks = re.findall(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL)
+        for block in json_blocks:
+            try:
+                data = json.loads(block)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                continue
+
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+        return {"status": "done", "summary": raw[:240]}
+
+
+@dataclass
+class AutoVerificationRun:
+    """Single automatic verification command result."""
+
+    command: str
+    success: bool
+    output: str
+    elapsed_ms: float = 0
+
+
+@dataclass
+class AutoVerificationReport:
+    """Summary of an automatic verification batch."""
+
+    success: bool
+    summary: str
+    changed_files: list[str] = field(default_factory=list)
+    runs: list[AutoVerificationRun] = field(default_factory=list)
+
+
+class AutoVerifier:
+    """Infer and run lightweight verification commands after code edits."""
+
+    def __init__(self, project_root: Path, tools: ToolRegistry):
+        self.project_root = project_root.resolve()
+        self.tools = tools
+
+    def verify(
+        self,
+        changed_files: list[str],
+        ctx: ToolExecutionContext,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> AutoVerificationReport:
+        changed_files = sorted({path.replace("\\", "/") for path in changed_files if path})
+        commands = self.infer_commands(changed_files)
+        if not commands:
+            return AutoVerificationReport(
+                success=True,
+                summary="No automatic verification command inferred for the changed files.",
+                changed_files=changed_files,
+            )
+
+        runs: list[AutoVerificationRun] = []
+        all_success = True
+        for command in commands:
+            if on_progress:
+                on_progress(f"  Auto-verify: {command}")
+            result = self.tools.execute(
+                "shell",
+                {"command": command},
+                ctx,
+                on_progress=on_progress,
+            )
+            run = AutoVerificationRun(
+                command=command,
+                success=result.success,
+                output=result.output[:4000],
+                elapsed_ms=result.elapsed_ms,
+            )
+            runs.append(run)
+            if not run.success:
+                all_success = False
+                break
+
+        summary_lines = []
+        if runs:
+            for run in runs:
+                marker = "PASS" if run.success else "FAIL"
+                first_line = run.output.strip().splitlines()[0] if run.output.strip() else "(no output)"
+                summary_lines.append(f"{marker} {run.command} -> {first_line[:160]}")
+        else:
+            summary_lines.append("No automatic verification commands were executed.")
+
+        return AutoVerificationReport(
+            success=all_success,
+            summary="\n".join(summary_lines),
+            changed_files=changed_files,
+            runs=runs,
+        )
+
+    def infer_commands(self, changed_files: list[str]) -> list[str]:
+        """Infer the smallest reasonable verification command set."""
+        if not changed_files:
+            return []
+
+        if self._is_python_project():
+            commands = self._python_commands(changed_files)
+            if commands:
+                return commands
+
+        if (self.project_root / "Cargo.toml").exists():
+            return ["cargo test"]
+
+        if (self.project_root / "go.mod").exists():
+            return ["go test ./..."]
+
+        if (self.project_root / "package.json").exists():
+            return ["npm test -- --runInBand"]
+
+        return []
+
+    def _is_python_project(self) -> bool:
+        return (
+            (self.project_root / "pyproject.toml").exists()
+            or (self.project_root / "setup.py").exists()
+            or (self.project_root / "tests").exists()
+            or any(path.endswith(".py") for path in self._all_python_files())
+        )
+
+    def _python_commands(self, changed_files: list[str]) -> list[str]:
+        targeted_tests = self._map_python_tests(changed_files)
+        if targeted_tests:
+            args = " ".join(self._quote_arg(path) for path in targeted_tests[:8])
+            return [f"python -m pytest {args} -q"]
+
+        all_tests = sorted(
+            path.relative_to(self.project_root).as_posix()
+            for path in (self.project_root / "tests").glob("test_*.py")
+        ) if (self.project_root / "tests").exists() else []
+        if all_tests:
+            if len(all_tests) <= 8:
+                args = " ".join(self._quote_arg(path) for path in all_tests)
+                return [f"python -m pytest {args} -q"]
+            return ["python -m pytest tests -q"]
+
+        return []
+
+    def _map_python_tests(self, changed_files: list[str]) -> list[str]:
+        candidates: set[str] = set()
+        tests_dir = self.project_root / "tests"
+        if not tests_dir.exists():
+            return []
+
+        for rel_path in changed_files:
+            path = Path(rel_path)
+            if path.parts and path.parts[0] == "tests" and path.name.startswith("test_") and path.suffix == ".py":
+                if (self.project_root / rel_path).exists():
+                    candidates.add(rel_path)
+                continue
+
+            if path.suffix != ".py":
+                continue
+
+            stem = path.stem
+            if stem == "__init__" and len(path.parts) > 1:
+                stem = path.parts[-2]
+
+            direct = tests_dir / f"test_{stem}.py"
+            if direct.exists():
+                candidates.add(direct.relative_to(self.project_root).as_posix())
+
+            pattern = f"test_*{stem}*.py"
+            for match in tests_dir.glob(pattern):
+                candidates.add(match.relative_to(self.project_root).as_posix())
+
+        return sorted(candidates)
+
+    def _all_python_files(self) -> list[str]:
+        return [path.relative_to(self.project_root).as_posix() for path in self.project_root.rglob("*.py")]
+
+    @staticmethod
+    def _quote_arg(value: str) -> str:
+        if not value:
+            return '""'
+        if re.search(r'[\s"&|<>^]', value):
+            return '"' + value.replace('"', '\\"') + '"'
+        return value
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1774,6 +2935,7 @@ class CodeAgent:
         model: str | None = None,
         max_steps: int = 5,
         use_planning: bool = True,
+        confirm_tool: Callable[[str, dict, ToolPermission, str | None], bool] | None = None,
     ):
         self.store = store
         self.root = project_root.resolve()
@@ -1785,13 +2947,75 @@ class CodeAgent:
         self.tools = build_default_registry()
         self.memory_st = ShortTermMemory(max_entries=20, max_tokens=30000)
         self.memory_lt = LongTermMemory(self.root)
+        self.repo_map = RepositoryMap(self.root)
         self.planner = Planner(self.llm, self.tools.list_definitions())
+        self.verifier = Verifier(self.llm)
+        self.auto_verifier = AutoVerifier(self.root, self.tools)
         
         self.ctx = ToolExecutionContext(
             root=self.root,
             store=store,
-            llm=self.llm
+            repo_map=self.repo_map,
+            llm=self.llm,
+            confirm_tool=confirm_tool,
         )
+
+    def _synthesize_verified_answer(self, question: str, plan: Plan | None) -> str:
+        """Generate the final answer after plan execution has been verified."""
+        plan_ctx = plan.to_context() if plan else "(no plan)"
+        mem_ctx = self.memory_st.get_context(max_chars=16000)
+
+        if not self.llm.available:
+            recent = "\n\n".join(self.memory_st.get_recent_tool_results(3))
+            return recent or "Unable to synthesize a final answer without an LLM."
+
+        system = (
+            "You are the final answer synthesizer for a coding agent. "
+            "Use the verified execution record to answer the user directly. "
+            "If some plan steps failed, explicitly mention the remaining blocker or uncertainty. "
+            "Do not call tools."
+        )
+        user = (
+            f"User question:\n{question}\n\n"
+            f"Verified plan state:\n{plan_ctx}\n\n"
+            f"Execution memory:\n{mem_ctx}\n\n"
+            "Write the final answer in Markdown."
+        )
+        answer = self.llm.complete(system, user, temperature=0.2)
+        return answer.strip() or "Unable to synthesize a final answer."
+
+    def _remember_changed_file(self, tool_name: str, params: dict, result: ToolResult, dirty_files: set[str]):
+        """Track files that need verification after write operations."""
+        if not result.success or tool_name not in {"write_file", "search_replace"}:
+            return
+
+        path = str(params.get("path", "")).strip().replace("\\", "/")
+        if path:
+            dirty_files.add(path)
+
+    def _run_auto_verification(
+        self,
+        dirty_files: set[str],
+        actions_log: list[dict],
+        tools_used: set[str],
+        on_progress: Callable[[str], None] | None = None,
+    ) -> AutoVerificationReport:
+        """Run automatic verification for the current dirty file set."""
+        report = self.auto_verifier.verify(sorted(dirty_files), self.ctx, on_progress=on_progress)
+        self.memory_st.add("system", f"[auto_verify] {report.summary}"[:8000])
+
+        for run in report.runs:
+            actions_log.append({
+                "tool": "shell",
+                "params": {"command": run.command},
+                "success": run.success,
+                "elapsed_ms": run.elapsed_ms,
+                "auto_verify": True,
+                "verification": "auto",
+            })
+            tools_used.add("shell")
+
+        return report
     
     def run(
         self,
@@ -1831,17 +3055,63 @@ class CodeAgent:
         max_steps = self.max_steps if self.max_steps > 0 else 50
         action_history: list[tuple[str, str]] = []
         repeat_count = 0
+        dirty_files: set[str] = set()
+        pending_auto_verification = False
+        auto_verify_attempts = 0
+        max_auto_verify_attempts = 3
         
         while step < max_steps:
             # Check abort signal
             if self.ctx.abort_signal and self.ctx.abort_signal.is_set():
                 answer = "Operation cancelled by user."
                 break
+
+            current_plan_step = plan.current_step if plan else None
+            if plan and plan.done:
+                if pending_auto_verification:
+                    if auto_verify_attempts < max_auto_verify_attempts:
+                        auto_verify_attempts += 1
+                        report = self._run_auto_verification(
+                            dirty_files,
+                            actions_log,
+                            tools_used,
+                            on_progress=on_progress,
+                        )
+                        if report.success:
+                            pending_auto_verification = False
+                            dirty_files.clear()
+                        else:
+                            pending_auto_verification = False
+                            dirty_files.clear()
+                            if plan.steps:
+                                plan.steps[-1].status = "pending"
+                                plan.steps[-1].result = report.summary[:200]
+                            continue
+                    else:
+                        self.memory_st.add(
+                            "system",
+                            "Automatic verification budget exhausted. Mention the remaining verification risk in the final answer.",
+                        )
+                        pending_auto_verification = False
+                        dirty_files.clear()
+                if on_progress:
+                    on_progress("  所有计划步骤已完成验证，正在综合最终答案...")
+                answer = self._synthesize_verified_answer(question, plan)
+                break
             
             # Build prompt
             system = AGENT_SYSTEM.format(max_steps=max_steps, platform=sys.platform)
             tools_desc = self.tools.list_definitions()
             mem_ctx = self.memory_st.get_context()
+            repo_ctx = self.repo_map.prompt_context(question)
+            current_step_ctx = ""
+            if current_plan_step:
+                current_step_ctx = (
+                    "\n## Current Plan Step\n"
+                    f"Step {current_plan_step.index}: {current_plan_step.description}\n"
+                    f"Suggested tool: {current_plan_step.tool_hint or 'general'}\n"
+                    "Finish and verify this step before giving the final answer.\n"
+                )
             
             plan_ctx = ""
             if plan:
@@ -1850,6 +3120,8 @@ class CodeAgent:
             user_msg = f"""## 工具列表
 {tools_desc}
 {plan_ctx}
+{repo_ctx}
+{current_step_ctx}
 ## 记忆
 {mem_ctx}
 
@@ -1895,6 +3167,45 @@ class CodeAgent:
             
             # Check for final answer
             if "answer" in parsed and "tool" not in parsed:
+                if pending_auto_verification:
+                    if auto_verify_attempts < max_auto_verify_attempts:
+                        auto_verify_attempts += 1
+                        report = self._run_auto_verification(
+                            dirty_files,
+                            actions_log,
+                            tools_used,
+                            on_progress=on_progress,
+                        )
+                        if report.success:
+                            pending_auto_verification = False
+                            dirty_files.clear()
+                        else:
+                            self.memory_st.add(
+                                "system",
+                                "Automatic verification failed. Inspect the failing command output, fix the code, and only answer after checks pass.",
+                            )
+                            if plan and current_plan_step:
+                                current_plan_step.status = "pending"
+                                current_plan_step.result = report.summary[:200]
+                            continue
+                    else:
+                        self.memory_st.add(
+                            "system",
+                            "Automatic verification budget exhausted. Mention the remaining verification risk in the final answer.",
+                        )
+                        pending_auto_verification = False
+                        dirty_files.clear()
+                if current_plan_step:
+                    reminder = (
+                        f"Plan step {current_plan_step.index} still needs execution and verification "
+                        "before the final answer."
+                    )
+                    self.memory_st.add("system", reminder)
+                    if on_progress:
+                        on_progress(
+                            f"  Verifier: step {current_plan_step.index} is still open; requesting another action."
+                        )
+                    continue
                 answer = parsed["answer"]
                 break
             
@@ -1905,14 +3216,9 @@ class CodeAgent:
             if not tool_name:
                 answer = parsed.get("answer", raw)
                 break
-            
-            # Check permission
-            allowed, perm_msg = self.tools.check_permission(tool_name, params)
-            if not allowed:
-                self.memory_st.add("system", f"Permission denied: {perm_msg}")
-                if on_step:
-                    on_step(step, tool_name, f"Permission denied: {perm_msg}")
-                continue
+
+            if current_plan_step and current_plan_step.status == "pending":
+                current_plan_step.status = "running"
             
             # Execute tool with progress reporting
             result = self.tools.execute(
@@ -1920,12 +3226,42 @@ class CodeAgent:
                 on_progress=on_progress
             )
             
+            verification: VerificationResult | None = None
+            if plan and current_plan_step:
+                verification = self.verifier.verify_step(
+                    plan.goal,
+                    current_plan_step,
+                    tool_name,
+                    params,
+                    result,
+                )
+
+                verification_summary = verification.summary or result.output[:200]
+                current_plan_step.result = verification_summary[:200]
+                if verification.status == "done":
+                    current_plan_step.status = "done"
+                elif verification.status == "failed":
+                    current_plan_step.status = "failed"
+                    self.planner.refine_plan(plan, verification_summary or result.output)
+                else:
+                    current_plan_step.status = "pending"
+
+                verifier_note = f"[verifier] {verification.status}: {verification_summary}"
+                if verification.next_action:
+                    verifier_note += f" | next: {verification.next_action}"
+                self.memory_st.add("system", verifier_note[:8000])
+                if on_progress:
+                    suffix = f" ({verification.summary[:80]})" if verification.summary else ""
+                    on_progress(f"  Verifier: step {current_plan_step.index} -> {verification.status}{suffix}")
+
             # Log action
             actions_log.append({
                 "tool": tool_name,
                 "params": {k: str(v)[:50] for k, v in params.items()},
                 "success": result.success,
                 "elapsed_ms": result.elapsed_ms,
+                "plan_step": current_plan_step.index if current_plan_step else None,
+                "verification": verification.status if verification else "",
             })
             tools_used.add(tool_name)
             
@@ -1934,6 +3270,12 @@ class CodeAgent:
             
             # Store in memory
             self.memory_st.add("tool", f"[{tool_name}] {result.output[:8000]}", tool_name=tool_name)
+
+            self._remember_changed_file(tool_name, params, result, dirty_files)
+            if result.success and tool_name in {"write_file", "search_replace"}:
+                pending_auto_verification = True
+                if on_progress and params.get("path"):
+                    on_progress(f"  Verification pending for {params.get('path')}")
             
             # Repeat detection
             action_key = (tool_name, json.dumps(params, sort_keys=True, ensure_ascii=False)[:100])
@@ -1950,16 +3292,8 @@ class CodeAgent:
                 answer += summary if summary else "无法得出结论。"
                 break
             
-            # Update plan
-            if plan:
-                if result.success:
-                    plan.mark_current("done", result.output[:100])
-                else:
-                    plan.mark_current("failed", result.output[:100])
-                    self.planner.refine_plan(plan, result.output)
-            
             # Track no-result streak
-            if result.success and len(result.output) < 20:
+            if result.success and result.metadata.get("empty_result"):
                 no_result_streak += 1
             else:
                 no_result_streak = 0
@@ -2078,6 +3412,7 @@ class MultiAgentCoordinator:
         project_root: Path,
         model: str | None = None,
         num_workers: int = 2,
+        confirm_tool: Callable[[str, dict, ToolPermission, str | None], bool] | None = None,
     ):
         self.store = store
         self.root = project_root
@@ -2088,6 +3423,7 @@ class MultiAgentCoordinator:
         self.tasks: dict[str, WorkerTask] = {}
         self.results: dict[str, str] = {}
         self.on_progress: Callable[[str], None] | None = None
+        self.confirm_tool = confirm_tool
     
     def coordinate(
         self,
@@ -2097,6 +3433,9 @@ class MultiAgentCoordinator:
         """
         Coordinate multiple workers to answer a complex question.
         """
+        self.tasks = {}
+        self.results = {}
+
         # Store on_progress for worker callbacks
         self.on_progress = on_progress
         
@@ -2110,7 +3449,12 @@ class MultiAgentCoordinator:
             # Fallback to single agent
             if on_progress:
                 on_progress("Task decomposition returned empty, falling back to single agent...")
-            agent = CodeAgent(self.store, self.root, self.model)
+            agent = CodeAgent(
+                self.store,
+                self.root,
+                self.model,
+                confirm_tool=self.confirm_tool,
+            )
             result = agent.run(question)
             if on_progress:
                 on_progress(f"Single agent completed. Steps: {result.steps_taken}")
@@ -2119,6 +3463,8 @@ class MultiAgentCoordinator:
         if on_progress:
             for i, t in enumerate(subtasks, 1):
                 on_progress(f"  Subtask {i}: {t.description}")
+
+        self.tasks = {task.task_id: task for task in subtasks}
         
         # Step 2: Execute workers in parallel
         if on_progress:
@@ -2218,6 +3564,7 @@ class MultiAgentCoordinator:
             self.model,
             max_steps=10,
             use_planning=False,
+            confirm_tool=self.confirm_tool,
         )
         
         def on_worker_step(num, tool_name, preview):

@@ -5,11 +5,11 @@
 **A Local RAG-Powered Code Intelligence Engine with Multimodal Agent**
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://python.org)
-[![Version](https://img.shields.io/badge/Version-0.3.1-blue.svg)](https://github.com/HUAYUE1024/Snowcode)
+[![Version](https://img.shields.io/badge/Version-0.4.0-blue.svg)](https://github.com/HUAYUE1024/Snowcode)
 [![License: MIT](https://img.shields.io/badge/License-MIT-0DA338.svg)](LICENSE)
 [![Privacy](https://img.shields.io/badge/Privacy-100%25_Local-red.svg)](#privacy--security)
 
-*Query, analyze, and modify codebases through natural language. Features hybrid RAG retrieval, autonomous ReAct agents with planning & memory, and multimodal tools for images, PDFs, and scientific data.*
+*Query, analyze, verify, and modify codebases through natural language. Snowcode combines local hybrid retrieval with autonomous agents, repository-aware planning, write safeguards, and multimodal/data readers.*
 
 </div>
 
@@ -20,10 +20,12 @@
 | Feature | Description |
 |:--------|:------------|
 | **Hybrid Retrieval** | Dense (vector) + Sparse (BM25) + Cross-encoder reranking |
-| **Agent v2** | Enhanced ReAct agent with planning, memory, and 12+ tools |
+| **Agent v2** | Enhanced ReAct agent with planning, repo map grounding, memory, and 20+ tools |
 | **Multi-Agent** | Coordinator-Worker architecture for complex task decomposition |
-| **Multimodal** | Image analysis (OCR + AI), PDF parsing, document reading |
-| **Scientific Data** | NetCDF (.nc) file support for climate/ocean data analysis |
+| **Write Safety** | Runtime confirmation plus diff preview for file writes and replacements |
+| **Verification Loop** | `planner -> executor -> verifier -> test` flow after edits |
+| **Multimodal** | Image analysis, PDF parsing, Office docs, and structured data readers |
+| **Scientific Data** | NetCDF (.nc) and MATLAB `.mat` file support for scientific workflows |
 | **Interactive Chat** | Persistent session with command history (`agent-chat`) |
 | **File Creation** | Agent can write files, generate reports, and modify code |
 | **Multi-LLM** | DashScope / OpenAI-compatible / Ollama backends |
@@ -35,7 +37,7 @@
 
 ```bash
 # Install
-pip install -e ".[multimodal]"
+pip install -e ".[multimodal,data,scientific]"
 
 # Configure (interactive)
 snowcode config
@@ -52,6 +54,16 @@ snowcode agent2 "Analyze the project architecture"
 # Interactive agent session
 snowcode agent-chat
 ```
+
+### Agent2 New In This Update
+
+- `repo_map` for repository structure, symbol graph, and dependency-aware grounding
+- diff preview before `write_file` and `search_replace`
+- runtime confirmation flow that behaves better on Windows terminals
+- `--auto-approve` / `-y` for non-interactive or fast approval flows
+- automatic verification after edits, including inferred test commands
+- planner hint normalization so architecture questions prefer `repo_map`
+- richer readers via `data_reader`, `mat_reader`, and improved scientific fallbacks
 
 ---
 
@@ -83,6 +95,7 @@ snowcode agent-chat
 - `--steps N` — Max steps per turn (0 = unlimited)
 - `--no-plan` — Skip planning phase
 - `--model MODEL` — Specify LLM model
+- `--auto-approve`, `-y` — Skip runtime confirmation prompts
 
 ### Skills
 
@@ -100,6 +113,14 @@ snowcode agent-chat
 ---
 
 ## Agent Architecture
+
+Current `agent2` runtime loop:
+
+1. Planner decomposes the task into concrete steps.
+2. Executor chooses tools and performs reads, writes, or shell actions.
+3. Verifier checks whether the current step is actually complete.
+4. Auto verification runs suggested tests after edits.
+5. Final answer synthesis is grounded in verified execution history.
 
 ### Agent v2 (Enhanced)
 
@@ -131,22 +152,43 @@ snowcode agent-chat
                    └─────────────────────────┘
 ```
 
-### Tool Suite (12 tools)
+### Tool Suite (20+ tools)
+
+**Core code tools**
 
 | Tool | Type | Description |
 |:-----|:-----|:------------|
 | `search` | Read | Semantic code search |
-| `read_file` | Read | Read full file content |
+| `read_file` | Read | Read file content with line windows |
 | `find_pattern` | Read | Regex pattern search |
 | `list_dir` | Read | Directory structure |
-| `write_file` | Write | Create/overwrite file |
-| `search_replace` | Write | Find-and-replace code |
-| `shell` | Execute | Run terminal commands |
-| `image_reader` | Multimodal | Image OCR + AI analysis |
-| `pdf_reader` | Multimodal | PDF document parsing |
-| `document_reader` | Multimodal | Word/Excel/CSV/TXT reading |
-| `file_browser` | Multimodal | Directory file listing |
-| `nc_reader` | Scientific | NetCDF data analysis |
+| `repo_map` | Read | Repository structure, symbols, and dependencies |
+| `write_file` | Write | Create or overwrite a file with confirmation |
+| `search_replace` | Write | Find-and-replace with diff preview |
+| `shell` | Execute | Run terminal commands with confirmation |
+
+**Analysis tools**
+
+| Tool | Type | Description |
+|:-----|:-----|:------------|
+| `explain` | Skill | Explain a function, class, or file |
+| `review` | Skill | Code review for bugs, security, and performance |
+| `summary` | Skill | Architecture overview with repo-map fallback |
+| `trace` | Skill | Function or method call-chain tracing |
+| `compare` | Skill | Compare two files or modules |
+| `test_suggest` | Skill | Suggest test cases |
+
+**Multimodal and data tools**
+
+| Tool | Type | Description |
+|:-----|:-----|:------------|
+| `image_reader` | Multimodal | Image OCR and analysis |
+| `pdf_reader` | Multimodal | PDF parsing |
+| `document_reader` | Multimodal | Word, Excel, CSV, TXT, Markdown reading |
+| `data_reader` | Data | JSON, JSONL, YAML, TOML, INI, CSV, TSV, XML, NPY, NPZ, HDF5, Parquet, Feather |
+| `mat_reader` | Data | MATLAB `.mat` reader |
+| `file_browser` | Utility | Directory browsing by file type |
+| `nc_reader` | Scientific | NetCDF scientific data analysis |
 
 ---
 
@@ -162,16 +204,19 @@ snowcode agent2 "Analyze screenshots/ui.png and describe the layout"
 
 ### Document Reading
 - **PDF**: Extract text, metadata, specific pages
-- **Word/Excel/CSV**: Parse structured data
+- **Word/Excel/CSV**: Parse structured content
 - **HTML**: Extract readable content
+- **Structured Data**: Inspect JSON, JSONL, YAML, TOML, INI, TSV, XML, NPY, NPZ, HDF5, Parquet, and Feather
 
-### Scientific Data (NetCDF)
+### Scientific Data (NetCDF + MAT)
 ```bash
 snowcode agent2 "Analyze data/ocean_temp.nc variables and statistics"
+snowcode agent2 "Inspect experiments/model_output.mat"
 ```
 - View dimensions, variables, attributes
 - Extract variable data with slicing
-- Compute statistics (min/max/mean/std/percentiles)
+- Compute statistics (min/max/mean/std)
+- Read MATLAB `.mat` files through `mat_reader`
 
 ---
 
@@ -181,14 +226,20 @@ snowcode agent2 "Analyze data/ocean_temp.nc variables and statistics"
 # Basic installation
 pip install -e .
 
+# Better symbol extraction
+pip install -e ".[ast]"
+
 # With multimodal support (recommended)
 pip install -e ".[multimodal]"
+
+# With structured data readers
+pip install -e ".[data]"
 
 # With scientific data support
 pip install -e ".[scientific]"
 
 # All features
-pip install -e ".[multimodal,scientific]"
+pip install -e ".[ast,multimodal,data,scientific,test]"
 ```
 
 ### Dependencies
@@ -203,6 +254,9 @@ pip install -e ".[multimodal,scientific]"
 | `openai` | LLM API client |
 | `Pillow` | Image processing |
 | `PyMuPDF` | PDF reading |
+| `h5py` | HDF5 / MAT v7.3 support |
+| `pandas` + `pyarrow` | Parquet / Feather readers |
+| `scipy` | MATLAB `.mat` support |
 
 ---
 
@@ -245,6 +299,7 @@ All project data stored in `.snowcode/`:
 ├── file_hashes.json         # Incremental indexing
 ├── bm25.json                # BM25 inverted index
 ├── chat_history.json        # Chat memory
+├── repo_map.json            # Repository map and symbol graph cache
 └── memory.jsonl             # Agent long-term memory
 ```
 
@@ -254,6 +309,8 @@ All project data stored in `.snowcode/`:
 
 - **Local Indexing**: All embedding, BM25, and parsing runs locally
 - **Path Validation**: All file operations restricted to project root
+- **Runtime Confirmation**: Write and shell tools can require approval
+- **Diff Preview**: File edits show a preview before confirmation
 - **Backup Safety**: Destructive operations create `.bak` backups
 - **No Telemetry**: Zero analytics or external tracking
 - **Optional LLM**: Works in retrieval-only mode without any API key

@@ -4,7 +4,21 @@ import fnmatch
 import os
 from pathlib import Path
 
-import pathspec
+try:
+    import pathspec
+except Exception:  # pragma: no cover - fallback for minimal environments
+    class _FallbackPathSpec:
+        @classmethod
+        def from_lines(cls, *_args, **_kwargs):
+            return cls()
+
+        def match_file(self, *_args, **_kwargs) -> bool:
+            return False
+
+    class _FallbackPathSpecModule:
+        PathSpec = _FallbackPathSpec
+
+    pathspec = _FallbackPathSpecModule()
 
 from .config import CODE_EXTENSIONS, DOC_EXTENSIONS, CONFIG_EXTENSIONS, MAX_FILE_SIZE, SKIP_DIRS
 

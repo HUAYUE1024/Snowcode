@@ -131,8 +131,6 @@ def _get_llm_config(model: str | None = None) -> tuple[str, str, str, bool]:
     # Return empty config.
     return "", "", "", False
 
-    return "", "", "", False
-
 
 def _call_llm(prompt: str, model: str | None = None, _system_override: str | None = None, history: list[dict] | None = None, max_retries: int = 3) -> str:
     """Non-streaming LLM call (used as fallback)."""

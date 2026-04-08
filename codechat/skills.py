@@ -154,12 +154,19 @@ SKILL_QUERIES = {
 
 
 def run_skill(
-    store: VectorStore,
+    store: VectorStore | None,
     skill_name: str,
     question: str,
     model: str | None = None,
 ) -> dict:
     """Run a skill synchronously."""
+    if store is None:
+        return {
+            "answer": "No vector index is available for this skill.",
+            "sources": [],
+            "context": "",
+        }
+
     skill = SKILL_QUERIES[skill_name]
     query = _build_skill_query(question, skill["query_suffix"])
     results = store.query(query, n_results=skill["n_context"])
@@ -195,7 +202,7 @@ def run_skill(
 
 
 def run_skill_stream(
-    store: VectorStore,
+    store: VectorStore | None,
     skill_name: str,
     question: str,
     model: str | None = None,
@@ -203,6 +210,12 @@ def run_skill_stream(
     on_answer=None,
 ) -> dict:
     """Run a skill with streaming output."""
+    if store is None:
+        msg = "No vector index is available for this skill."
+        if on_answer:
+            on_answer(msg)
+        return {"answer": msg, "sources": [], "context": ""}
+
     skill = SKILL_QUERIES[skill_name]
     query = _build_skill_query(question, skill["query_suffix"])
     results = store.query(query, n_results=skill["n_context"])

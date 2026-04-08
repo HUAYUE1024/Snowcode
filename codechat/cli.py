@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -23,8 +24,10 @@ from rich.markdown import Markdown
 from rich.live import Live
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.prompt import Confirm
 from rich.table import Table
 from rich.syntax import Syntax
+from rich.text import Text
 
 from . import __version__
 
@@ -42,6 +45,76 @@ from .skills import run_skill, run_skill_stream, SKILL_QUERIES
 from .store import VectorStore
 
 console = Console(legacy_windows=False)
+_TOOL_CONFIRM_LOCK = threading.Lock()
+_TOOL_AUTO_APPROVE = os.environ.get("SNOWCODE_AUTO_APPROVE", "").strip().lower() in {
+    "1", "true", "yes", "y", "on",
+}
+
+
+def _set_tool_auto_approve(enabled: bool):
+    """Configure whether tool confirmations should be auto-approved."""
+    global _TOOL_AUTO_APPROVE
+    _TOOL_AUTO_APPROVE = bool(enabled)
+
+
+def _ask_tool_confirmation(prompt: str, default: bool = False) -> bool:
+    """Read a confirmation choice robustly, with a Windows console fallback."""
+    if _TOOL_AUTO_APPROVE:
+        console.print("[dim]Auto-approved by CLI setting.[/]")
+        return True
+
+    if sys.stdin and sys.stdin.isatty():
+        if sys.platform == "win32":
+            try:
+                import msvcrt
+
+                default_label = "y" if default else "n"
+                console.print(f"{prompt} [y/n] ({default_label}): ", end="")
+                while True:
+                    ch = msvcrt.getwch()
+                    if ch in ("\r", "\n"):
+                        console.print(default_label)
+                        return default
+                    lower = ch.lower()
+                    if lower in {"y", "n"}:
+                        console.print(lower)
+                        return lower == "y"
+                    if ch == "\x03":
+                        raise KeyboardInterrupt
+            except (EOFError, KeyboardInterrupt):
+                console.print()
+                return default
+            except Exception:
+                pass
+
+        try:
+            return Confirm.ask(prompt, default=default, console=console)
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return default
+
+    console.print(
+        "[dim]Interactive input is unavailable, so this confirmation defaults to deny. "
+        "Use --auto-approve to skip prompts.[/]"
+    )
+    return default
+
+
+def _confirm_tool_use(tool_name: str, params: dict, permission, details: str | None = None) -> bool:
+    """Ask the user to approve a tool call at runtime."""
+    with _TOOL_CONFIRM_LOCK:
+        level = "dangerous" if getattr(permission, "value", "") == "dangerous" else "write"
+        console.print()
+        console.print(f"[bold yellow]Tool confirmation required[/]  [dim]({level})[/]")
+        console.print(f"  [cyan]{tool_name}[/]")
+        for key, value in params.items():
+            preview = str(value)
+            if len(preview) > 160:
+                preview = preview[:157] + "..."
+            console.print(f"  [dim]{key}[/]: {preview}")
+        if details:
+            console.print(Panel(Text(details), title="Diff Preview", border_style="magenta"))
+        return _ask_tool_confirmation("Allow this tool call?", default=False)
 
 
 def _find_project_root() -> Path:
@@ -1022,11 +1095,13 @@ def agent(question: tuple[str, ...], path: str | None, model: str | None, steps:
 @click.option("--no-plan", is_flag=True, help="Skip planning phase")
 @click.option("--multi-agent", is_flag=True, help="Use multi-agent coordinator for complex tasks")
 @click.option("--workers", "-w", default=2, type=int, help="Number of worker agents for multi-agent mode (default: 2)")
+@click.option("--auto-approve", "-y", is_flag=True, help="Automatically approve tool confirmation prompts")
 def agent2(question: tuple[str, ...], path: str | None, model: str | None, steps: int,
-           no_plan: bool, multi_agent: bool, workers: int):
+           no_plan: bool, multi_agent: bool, workers: int, auto_approve: bool):
     """Enhanced agent v2: Better tools, memory, and multi-agent support."""
     root = Path(path).resolve() if path else _find_project_root()
     q = " ".join(question)
+    _set_tool_auto_approve(auto_approve)
 
     store = VectorStore(root)
     if store.count() == 0:
@@ -1054,11 +1129,24 @@ def agent2(question: tuple[str, ...], path: str | None, model: str | None, steps
     if multi_agent:
         console.print(f"\n  [dim]LLM: {llm_model} | Mode: Multi-Agent Coordinator | Workers: {workers}[/]")
         console.print(f"  [dim]Tools: {tools_info}[/]\n")
-        agent = create_coordinator_v2(store, root, model=model, num_workers=workers)
+        agent = create_coordinator_v2(
+            store,
+            root,
+            model=model,
+            num_workers=workers,
+            confirm_tool=_confirm_tool_use,
+        )
     else:
         console.print(f"\n  [dim]LLM: {llm_model} | Steps: {steps} | Planning: {'on' if not no_plan else 'off'}[/]")
         console.print(f"  [dim]Tools: {tools_info}[/]\n")
-        agent = create_agent_v2(store, root, model=model, max_steps=steps, use_planning=not no_plan)
+        agent = create_agent_v2(
+            store,
+            root,
+            model=model,
+            max_steps=steps,
+            use_planning=not no_plan,
+            confirm_tool=_confirm_tool_use,
+        )
 
     # Progress callbacks
     step_count = [0]
@@ -1080,30 +1168,27 @@ def agent2(question: tuple[str, ...], path: str | None, model: str | None, steps
     def on_progress(t):
         console.print(f"  [cyan]{t}[/]")
 
-    # Execute
-    with Live(console=console, refresh_per_second=4) as live:
-        if multi_agent:
-            # Multi-agent coordinator
-            answer = agent.coordinate(q, on_progress=on_progress)
-            result = type('Result', (), {
-                'answer': answer,
-                'steps_taken': step_count[0],
-                'memory_entries': 0,
-                'tools_used': [],
-                'actions': []
-            })()
-            # Print the final answer
-            console.print()
-            console.print(Panel(Markdown(answer), title="[bold green]Answer[/]", border_style="green", padding=(1, 2)))
-        else:
-            # Enhanced agent v2
-            result = agent.run(
-                q,
-                on_step=on_step,
-                on_think=on_think,
-                on_answer=on_answer,
-                on_progress=on_progress
-            )
+    # Execute. Avoid Rich Live here because it interferes with interactive confirmations
+    # on some Windows terminals.
+    if multi_agent:
+        answer = agent.coordinate(q, on_progress=on_progress)
+        result = type('Result', (), {
+            'answer': answer,
+            'steps_taken': step_count[0],
+            'memory_entries': 0,
+            'tools_used': [],
+            'actions': []
+        })()
+        console.print()
+        console.print(Panel(Markdown(answer), title="[bold green]Answer[/]", border_style="green", padding=(1, 2)))
+    else:
+        result = agent.run(
+            q,
+            on_step=on_step,
+            on_think=on_think,
+            on_answer=on_answer,
+            on_progress=on_progress
+        )
 
     # Show execution summary
     console.print()
@@ -1125,13 +1210,15 @@ def agent2(question: tuple[str, ...], path: str | None, model: str | None, steps
 @click.option("--steps", "-s", default=0, type=int, help="Max agent steps per turn (default: 0=unlimited)")
 @click.option("--multi-agent", is_flag=True, help="Use multi-agent coordinator")
 @click.option("--workers", "-w", default=2, type=int, help="Number of worker agents")
+@click.option("--auto-approve", "-y", is_flag=True, help="Automatically approve tool confirmation prompts")
 def agent_chat(path: str | None, model: str | None, steps: int,
-               multi_agent: bool, workers: int):
+               multi_agent: bool, workers: int, auto_approve: bool):
     """Interactive agent session: keep chatting without re-entering commands."""
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import FileHistory
     
     root = Path(path).resolve() if path else _find_project_root()
+    _set_tool_auto_approve(auto_approve)
     
     store = VectorStore(root)
     if store.count() == 0:
@@ -1143,10 +1230,26 @@ def agent_chat(path: str | None, model: str | None, steps: int,
         console.print("[red]No LLM configured. Run [cyan]snowcode config[/] or set DASHSCOPE_API_KEY.[/]")
         return
     
-    console.print(f"\n  [dim]LLM: {llm_model} | Steps: {steps}[/]\n")
-    
-    # Create agent once and reuse (preserves memory across turns)
-    agent = create_agent_v2(store, root, model=model, max_steps=steps, use_planning=True)
+    if multi_agent:
+        console.print(f"\n  [dim]LLM: {llm_model} | Mode: Multi-Agent Coordinator | Workers: {workers}[/]\n")
+        agent = create_coordinator_v2(
+            store,
+            root,
+            model=model,
+            num_workers=workers,
+            confirm_tool=_confirm_tool_use,
+        )
+    else:
+        console.print(f"\n  [dim]LLM: {llm_model} | Steps: {steps}[/]\n")
+        # Create agent once and reuse (preserves memory across turns)
+        agent = create_agent_v2(
+            store,
+            root,
+            model=model,
+            max_steps=steps,
+            use_planning=True,
+            confirm_tool=_confirm_tool_use,
+        )
     
     console.print(f"\n[bold cyan]snowcode[/] v{__version__} - Agent Chat")
     console.print("[dim]Type your question. /exit or Ctrl+D to quit.[/]\n")
@@ -1172,8 +1275,11 @@ def agent_chat(path: str | None, model: str | None, steps: int,
             console.print("[dim]Goodbye.[/]")
             break
         if q.lower() == "/clear":
-            agent.reset_memory()
-            console.print("[dim]Memory cleared.[/]")
+            if hasattr(agent, "reset_memory"):
+                agent.reset_memory()
+                console.print("[dim]Memory cleared.[/]")
+            else:
+                console.print("[dim]Multi-agent mode does not keep shared chat memory.[/]")
             continue
         if q.lower() == "/help":
             console.print("[dim]Commands: /exit, /clear, /help[/]")
@@ -1190,16 +1296,24 @@ def agent_chat(path: str | None, model: str | None, steps: int,
         def on_answer(t):
             console.print()
             console.print(Panel(Markdown(t), title="[bold green]Answer[/]", border_style="green", padding=(1, 2)))
+
+        def on_progress(t):
+            console.print(f"  [cyan]{t}[/]")
         
-        result = agent.run(
-            q,
-            on_step=on_step,
-            on_think=on_think,
-            on_answer=on_answer,
-        )
-        
-        if result.actions:
-            console.print(f"  [dim]Steps: {result.steps_taken} | Memory: {result.memory_entries}[/]\n")
+        if multi_agent:
+            answer = agent.coordinate(q, on_progress=on_progress)
+            on_answer(answer)
+        else:
+            result = agent.run(
+                q,
+                on_step=on_step,
+                on_think=on_think,
+                on_answer=on_answer,
+                on_progress=on_progress,
+            )
+            
+            if result.actions:
+                console.print(f"  [dim]Steps: {result.steps_taken} | Memory: {result.memory_entries}[/]\n")
 
 
 @cli.command()
@@ -1207,146 +1321,128 @@ def agent_help():
     """Detailed guide for agent and agent2 commands."""
     from rich.panel import Panel
     from rich.table import Table
-    from rich.tree import Tree
-    from rich.markdown import Markdown
-    
+
     console.print()
-    
-    # Header
     console.print(Panel(
-        "[bold cyan]Snowcode Agent 使用指南[/]",
+        f"[bold cyan]Snowcode Agent Guide v{__version__}[/]",
         border_style="cyan",
         padding=(1, 2)
     ))
     console.print()
-    
-    # Agent vs Agent2 comparison
-    console.print("[bold yellow]Agent vs Agent2 对比[/]\n")
-    
+
+    console.print("[bold yellow]agent vs agent2[/]\n")
     table = Table(show_header=True, border_style="dim")
-    table.add_column("特性", style="cyan", width=20)
-    table.add_column("agent", style="green", width=35)
-    table.add_column("agent2 (推荐)", style="bright_green", width=35)
-    
-    table.add_row("架构", "ReAct 单智能体", "增强版 ReAct + 多智能体")
-    table.add_row("工具数量", "15个 (含多模态)", "12个 (精选工具)")
-    table.add_row("多模态", "支持", "支持")
-    table.add_row("NC数据", "支持", "支持")
-    table.add_row("记忆管理", "基础", "增强 (Token估算)")
-    table.add_row("权限系统", "无", "权限检查")
-    table.add_row("并发控制", "无", "并发安全")
-    table.add_row("输出格式", "标准", "带执行摘要表格")
-    table.add_row("适用场景", "简单查询", "复杂分析、多模态")
-    
+    table.add_column("Feature", style="cyan", width=20)
+    table.add_column("agent", style="green", width=28)
+    table.add_column("agent2 (recommended)", style="bright_green", width=42)
+    table.add_row("Architecture", "Single-agent ReAct", "Planner + tools + verifier + optional multi-agent")
+    table.add_row("Planning", "Basic", "Step planning with tool hints")
+    table.add_row("Repo awareness", "Search-oriented", "Repo map + symbol graph grounding")
+    table.add_row("Write safety", "Lightweight", "Runtime confirmation + diff preview")
+    table.add_row("Verification", "Manual follow-up", "Auto verification after edits")
+    table.add_row("Tooling", "Core coding tools", "20+ coding, skill, multimodal, and data tools")
+    table.add_row("Data readers", "Limited", "JSON/YAML/TOML/MAT/NetCDF/HDF5/Parquet and more")
+    table.add_row("Best for", "Quick exploration", "Real coding tasks and deeper repository workflows")
     console.print(table)
     console.print()
-    
-    # Agent1 details
+
     console.print(Panel(
-        "[bold]agent 命令[/]\n[dim]基础 ReAct 智能体，适合快速查询[/]\n\n"
-        "[bold cyan]用法:[/]\n"
-        "  snowcode agent \"你的问题\"\n\n"
-        "[bold cyan]参数:[/]\n"
-        "  [green]--steps, -s[/]    最大执行步数 (默认0=无限制)\n"
-        "  [green]--no-plan[/]      跳过规划阶段\n"
-        "  [green]--coordinator[/]  启用协调器模式(多智能体)\n"
-        "  [green]--workers, -w[/]  Worker数量 (默认2)\n"
-        "  [green]--model, -m[/]    指定LLM模型\n"
-        "  [green]--path, -p[/]     指定项目路径\n\n"
-        "[bold cyan]示例:[/]\n"
-        "  snowcode agent \"解释项目架构\"\n"
-        "  snowcode agent \"分析安全漏洞\" --coordinator --workers 3",
+        """[bold]agent[/]
+[dim]Lightweight ReAct agent for simple one-shot exploration.[/]
+
+[bold cyan]Usage[/]
+  snowcode agent "your question"
+
+[bold cyan]Useful options[/]
+  [green]--steps, -s[/]      Max steps per turn
+  [green]--no-plan[/]        Skip planning
+  [green]--coordinator[/]    Use coordinator-worker mode
+  [green]--workers, -w[/]    Worker count for coordinator mode
+  [green]--model, -m[/]      Override model
+  [green]--path, -p[/]       Project root
+
+[bold cyan]Examples[/]
+  snowcode agent "Explain the auth flow"
+  snowcode agent --coordinator --workers 3 "Review the project for security issues"
+""",
         border_style="blue",
         padding=(1, 2)
     ))
     console.print()
-    
-    # Agent2 details
+
     console.print(Panel(
-        "[bold]agent2 命令 (推荐)[/]\n[dim]增强版智能体，更多功能，更好体验[/]\n\n"
-        "[bold cyan]用法:[/]\n"
-        "  snowcode agent2 \"你的问题\"\n\n"
-        "[bold cyan]参数:[/]\n"
-        "  [green]--steps, -s[/]      最大执行步数 (默认0=无上限)\n"
-        "  [green]--no-plan[/]        跳过规划阶段\n"
-        "  [green]--multi-agent[/]    启用多智能体协作模式\n"
-        "  [green]--workers, -w[/]    Worker数量 (默认2)\n"
-        "  [green]--model, -m[/]      指定LLM模型\n"
-        "  [green]--path, -p[/]       指定项目路径\n\n"
-        "[bold cyan]示例:[/]\n"
-        "  snowcode agent2 \"解释项目架构\"\n"
-        "  snowcode agent2 --multi-agent \"全面分析项目\"\n"
-        "  snowcode agent2 --multi-agent --workers 3 \"深度安全审计\"\n"
-        "  snowcode agent2 --steps 10 \"复杂代码分析\"\n"
-        "  snowcode agent2 --no-plan \"快速搜索\"",
+        """[bold]agent2[/]
+[dim]Full-featured coding agent with planning, repo grounding, verification, and richer tools.[/]
+
+[bold cyan]Usage[/]
+  snowcode agent2 "your question"
+
+[bold cyan]Useful options[/]
+  [green]--steps, -s[/]          Max steps per turn (`0` = unlimited)
+  [green]--no-plan[/]            Skip planning
+  [green]--multi-agent[/]        Enable coordinator-worker mode
+  [green]--workers, -w[/]        Worker count for multi-agent mode
+  [green]--auto-approve, -y[/]   Auto-approve runtime tool confirmations
+  [green]--model, -m[/]          Override model
+  [green]--path, -p[/]           Project root
+
+[bold cyan]Examples[/]
+  snowcode agent2 "Explain the repository structure"
+  snowcode agent2 -y "Refactor the config loader and run tests"
+  snowcode agent2 --multi-agent --workers 3 "Audit caching and data flow"
+""",
         border_style="green",
         padding=(1, 2)
     ))
     console.print()
-    
-    # Multi-agent explanation
+
     console.print(Panel(
-        "[bold yellow]多智能体模式详解 (--multi-agent)[/]\n\n"
-        "[bold]工作原理:[/]\n"
-        "  1. [cyan]Coordinator[/] (协调器) 分析任务复杂度\n"
-        "  2. 将任务拆分为多个子任务\n"
-        "  3. 分配给多个 [cyan]Worker[/] 并行执行\n"
-        "  4. 综合所有Worker的结果，生成最终回答\n\n"
-        "[bold]何时使用:[/]\n"
-        "  • 需要同时分析多个文件或模块\n"
-        "  • 需要执行不同类型的任务(分析+修改+测试)\n"
-        "  • 复杂的安全审计或代码审查\n"
-        "  • 生成完整的项目文档\n\n"
-        "[bold]参数说明:[/]\n"
-        "  [green]--multi-agent[/]   启用多智能体模式\n"
-        "  [green]--workers 2[/]     使用2个Worker (默认值)\n"
-        "  [green]--workers 3[/]     使用3个Worker (更复杂任务)\n"
-        "  [green]--workers 4[/]     使用4个Worker (最大推荐值)\n\n"
-        "[bold]注意:[/]\n"
-        "  • Worker越多，消耗Token越多\n"
-        "  • 简单任务不需要多智能体\n"
-        "  • 推荐: 2-3个Worker平衡效率与成本",
+        """[bold yellow]How agent2 works[/]
+
+1. Build a plan from the user request.
+2. Prefer repository-aware tools like [cyan]repo_map[/] for structure questions.
+3. Execute tools and verify each step before moving on.
+4. Ask for confirmation on writes and shell commands when needed.
+5. Run inferred checks after edits before giving the final answer.
+""",
         border_style="yellow",
         padding=(1, 2)
     ))
     console.print()
-    
-    # Multi-modal tools
+
     console.print(Panel(
-        "[bold magenta]多模态工具支持[/]\n\n"
-        "[bold]agent2 支持以下多模态工具:[/]\n\n"
-        "  [cyan]image_reader[/]      读取图片，OCR提取文字\n"
-        "  [cyan]pdf_reader[/]        读取PDF文档\n"
-        "  [cyan]document_reader[/]   读取Word/Excel/CSV等\n"
-        "  [cyan]file_browser[/]      浏览目录文件列表\n"
-        "  [cyan]nc_reader[/]         读取NetCDF科学数据\n\n"
-        "[bold]使用示例:[/]\n"
-        "  snowcode agent2 \"读取 screenshots/界面.png 中的文字\"\n"
-        "  snowcode agent2 \"分析 docs/需求文档.pdf 的内容\"\n"
-        "  snowcode agent2 \"查看 data/报表.xlsx 的数据\"\n"
-        "  snowcode agent2 \"列出项目中所有的图片文件\"\n"
-        "  snowcode agent2 \"查看 data/ocean_temp.nc 的变量\"",
+        """[bold magenta]Notable agent2 tools[/]
+
+[bold]Core[/]
+  [cyan]search[/], [cyan]read_file[/], [cyan]find_pattern[/], [cyan]list_dir[/], [cyan]repo_map[/]
+
+[bold]Write / execute[/]
+  [cyan]write_file[/], [cyan]search_replace[/], [cyan]shell[/]
+
+[bold]Analysis[/]
+  [cyan]explain[/], [cyan]review[/], [cyan]summary[/], [cyan]trace[/], [cyan]compare[/], [cyan]test_suggest[/]
+
+[bold]Multimodal / data[/]
+  [cyan]image_reader[/], [cyan]pdf_reader[/], [cyan]document_reader[/], [cyan]data_reader[/], [cyan]mat_reader[/], [cyan]file_browser[/], [cyan]nc_reader[/]""",
         border_style="magenta",
         padding=(1, 2)
     ))
     console.print()
-    
-    # Quick reference
+
     console.print(Panel(
-        "[bold]快速参考[/]\n\n"
-        "[bold]场景 → 推荐命令:[/]\n\n"
-        "  简单查询        → [green]snowcode agent2 \"问题\"[/]\n"
-        "  复杂分析        → [green]snowcode agent2 --multi-agent \"问题\"[/]\n"
-        "  多文件分析      → [green]snowcode agent2 --multi-agent --workers 3 \"问题\"[/]\n"
-        "  快速搜索        → [green]snowcode agent2 --no-plan \"问题\"[/]\n"
-        "  深度分析        → [green]snowcode agent2 --steps 10 --multi-agent \"问题\"[/]\n"
-        "  读取图片/PDF    → [green]snowcode agent2 \"读取 xxx.png/pdf\"[/]\n"
-        "  读取NC数据      → [green]snowcode agent2 \"分析 xxx.nc\"[/]",
+        """[bold]Quick recommendations[/]
+
+  Simple question            -> [green]snowcode agent2 "question"[/]
+  Fast search                -> [green]snowcode agent2 --no-plan "question"[/]
+  Deep repository analysis   -> [green]snowcode agent2 --multi-agent --workers 3 "question"[/]
+  Safe automated edits       -> [green]snowcode agent2 "task"[/]
+  Faster automated edits     -> [green]snowcode agent2 -y "task"[/]
+  Interactive session        -> [green]snowcode agent-chat[/]
+  Interactive auto-approve   -> [green]snowcode agent-chat -y[/]""",
         border_style="white",
         padding=(1, 2)
     ))
     console.print()
-
 
 @cli.command()
 @click.option("--path", "-p", default=None, help="Project root path (default: auto-detect)")

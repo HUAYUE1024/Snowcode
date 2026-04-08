@@ -1,6 +1,6 @@
 """snowcode - Local RAG-powered codebase Q&A engine."""
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 # Export agent_v2 for enhanced agent functionality
 from .agent_v2 import (

@@ -1,6 +1,6 @@
 [project]
 name = "Snowcode"
-version = "0.3.1"
+version = "0.4.0"
 description = "Local RAG-powered CLI tool for chatting with your codebase"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -53,9 +53,18 @@ multimodal = [
     "openpyxl>=3.1",       # Excel spreadsheet reading
     "beautifulsoup4>=4.12", # HTML text extraction
 ]
+data = [
+    "PyYAML>=6.0",         # YAML support
+    "h5py>=3.10",          # HDF5 / MAT v7.3 support
+    "pandas>=2.0",         # Parquet / Feather helpers
+    "pyarrow>=14.0",       # Parquet / Feather engine
+    "tomli>=2.0; python_version < '3.11'",
+]
 scientific = [
     "netCDF4>=1.6",        # NetCDF file reading
     "xarray>=2023.0",      # Multi-dimensional data analysis
+    "scipy>=1.10",         # MAT files and scientific arrays
+    "h5py>=3.10",          # HDF5-backed MAT/NetCDF files
 ]
 
 [project.scripts]

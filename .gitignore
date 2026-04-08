@@ -68,3 +68,10 @@ venv.bak/
 .vscode/
 *.swp
 *.swo
+
+# Local agent/test scratch space
+smoke_check/
+.tmp_agent2_checks/
+.tmp_agent_checks_runtime/
+.tmp_agent_checks_runtime_*/
+.tmp_pytest/
